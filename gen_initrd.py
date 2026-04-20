@@ -243,7 +243,10 @@ def main():
         gen_icon_power,
     ]
 
-    with tarfile.open(out, "w:") as tf:
+    # USTAR (format=0) garantiza cabeceras de 512 bytes compatibles con el
+    # parser de vfs.c. El formato PAX (default Python 3.8+) añade bloques
+    # extendidos que complican el walker innecesariamente para archivos pequeños.
+    with tarfile.open(out, "w:", format=tarfile.USTAR_FORMAT) as tf:
         print(f"  → background.bmp (256×192) ...", end=" ", flush=True)
         add_to_tar(tf, "background.bmp", gen_wallpaper(256, 192))
         print("OK")

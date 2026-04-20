@@ -27,8 +27,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-      - name: Install toolchain (GCC, NASM, GRUB, xorriso)
+      - name: Install toolchain (GCC, NASM, GRUB, xorriso, Python)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -36,7 +38,16 @@ jobs:
             nasm \
             grub-common \
             xorriso \
-            grub-pc-bin
+            grub-pc-bin \
+            python3 \
+            mtools
+
+      - name: Diagnostics
+        run: |
+          gcc --version
+          nasm --version
+          python3 --version
+          grub-mkrescue --version || true
 
       - name: make (kernel + ISO)
         run: |
