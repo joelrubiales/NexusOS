@@ -1,0 +1,21 @@
+# Artefactos de compilación
+*.o
+kernel.elf
+kernel.tmp
+iso/
+NexusOS.iso
+dist/
+*.img
+vbox_latest.log
+
+# Toolchain local (nasm empaquetado; instalar con apt en CI u otra máquina)
+.tools/
+
+# Binarios legacy / generados fuera del Makefile actual
+boot.bin
+boot2.bin
+
+# Editor / entorno
+.cursor/
+*.swp
+*~
