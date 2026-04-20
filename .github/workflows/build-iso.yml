@@ -1,15 +1,24 @@
-# Compila NexusOS en cada push a main y publica NexusOS.iso como artifact descargable.
-# Descarga: pestaña Actions → el workflow más reciente → Artifacts.
+# ── ISO automática en GitHub ─────────────────────────────────────────────
+# No hace falta pulsar nada en GitHub: basta con subir cambios a esta rama.
+#
+#   git add .
+#   git commit -m "..."
+#   git push origin main
+#
+# → Actions compila con `make` y deja NexusOS.iso en Artifacts (~1–3 min).
+# También: pestaña Actions → "Build ISO" → "Run workflow" (manual).
 
 name: Build ISO
 
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
-  group: build-iso-${{ github.ref }}
+  group: build-iso-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
