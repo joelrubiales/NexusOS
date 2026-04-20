@@ -1,0 +1,44 @@
+# Compila NexusOS en cada push a main y publica NexusOS.iso como artifact descargable.
+# Descarga: pestaña Actions → el workflow más reciente → Artifacts.
+
+name: Build ISO
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-iso-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain (GCC, NASM, GRUB, xorriso)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            nasm \
+            grub-common \
+            xorriso \
+            grub-pc-bin
+
+      - name: make (kernel + ISO)
+        run: |
+          make -j"$(nproc)"
+          test -f NexusOS.iso
+          ls -la NexusOS.iso kernel.elf
+
+      - name: Upload NexusOS.iso
+        uses: actions/upload-artifact@v4
+        with:
+          name: NexusOS
+          path: NexusOS.iso
+          if-no-files-found: error
+          retention-days: 90
