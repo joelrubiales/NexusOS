@@ -170,7 +170,35 @@ int keyboard_irq(uint8_t sc, int extended) {
     if (sc == 0x1Du || sc == 0x38u)
         return 0;
 
-    /* TAB (0x0F) y Enter (0x1C): navegación en instalador con foco */
+    /* ── TEXT_INPUT con foco: capturar toda la entrada de texto ──────────── */
+    if (ui_element_count > 0 &&
+        focused_element_index >= 0 &&
+        focused_element_index < ui_element_count &&
+        ui_elements[focused_element_index].type == UI_TYPE_TEXT_INPUT) {
+
+        /* Backspace */
+        if (sc == 0x0Eu) { ui_handle_char('\b'); return 1; }
+
+        /* TAB / Enter: avanzar foco al siguiente widget */
+        if (sc == 0x0Fu || sc == 0x1Cu) { ui_focus_advance(); return 1; }
+
+        /* ESC: dejar caer (no consumir) para que el bucle exterior lo vea */
+        if (sc == 0x01u) return 0;
+
+        /* Caracteres imprimibles */
+        base = (sc < 128u) ? sc_us_normal[sc] : 0;
+        sh   = (sc < 128u) ? sc_us_shift[sc] : 0;
+        if (kbd_shift) {
+            ch = sh ? sh : base;
+            if (!ch && base >= 'a' && base <= 'z') ch = (char)(base - 32);
+        } else {
+            ch = base;
+        }
+        if (ch >= 32) ui_handle_char((unsigned char)ch);
+        return 1;  /* consumir siempre cuando TEXT_INPUT tiene el foco */
+    }
+
+    /* ── TAB (0x0F) y Enter (0x1C): navegación general en instalador ─────── */
     if (ui_element_count > 0) {
         if (sc == 0x0Fu) {
             ui_focus_advance();

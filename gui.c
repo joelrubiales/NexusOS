@@ -14,6 +14,7 @@
 #include "mouse_gui.h"
 #include "apps.h"
 #include "top_panel.h"
+#include "font_data.h"
 #include <stdint.h>
 
 extern volatile unsigned char tecla_nueva;
@@ -657,26 +658,30 @@ void gui_run(void) {
     limpiar_pantalla();
 }
 
-/* ── Gestor de foco (TAB / Enter en instalador y UI con teclado) ───────── */
-UI_Element ui_elements[UI_MAX_ELEMENTS];
-int ui_element_count;
-int focused_element_index;
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Widget system — estado global, registro, renderizado, entrada.
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
+UI_Element ui_elements[UI_MAX_ELEMENTS];
+int        ui_element_count;
+int        focused_element_index;
+
+/* ── Foco ───────────────────────────────────────────────────────────────── */
 void ui_focus_advance(void) {
-    if (ui_element_count <= 0)
-        return;
+    if (ui_element_count <= 0) return;
     focused_element_index = (focused_element_index + 1) % ui_element_count;
 }
 
 void ui_redraw(void) {
-    /* Los bucles gráficos ya repintan cada frame; hook para extensiones. */
+    /* El bucle gráfico repinta cada frame; hook disponible para extensiones. */
 }
 
 void ui_focus_clear(void) {
-    ui_element_count        = 0;
-    focused_element_index   = 0;
+    ui_element_count      = 0;
+    focused_element_index = 0;
 }
 
+/* ── Hit-test ───────────────────────────────────────────────────────────── */
 int ui_get_element_at(int x, int y) {
     int i;
     for (i = ui_element_count - 1; i >= 0; i--) {
@@ -693,13 +698,253 @@ void ui_update_focus_from_mouse(int mx, int my) {
         focused_element_index = idx;
 }
 
+/* ── Activación ─────────────────────────────────────────────────────────── */
 void ui_activate_focused(void) {
-    UI_ElementCallback cb;
-    if (ui_element_count <= 0)
+    UI_Element* el;
+    if (ui_element_count <= 0) return;
+    if (focused_element_index < 0 || focused_element_index >= ui_element_count) return;
+
+    el = &ui_elements[focused_element_index];
+
+    /* CHECKBOX: toggle al activar; ejecutar callback si existe. */
+    if (el->type == UI_TYPE_CHECKBOX) {
+        el->is_checked = !el->is_checked;
+        if (el->callback) el->callback();
         return;
-    if (focused_element_index < 0 || focused_element_index >= ui_element_count)
-        return;
-    cb = ui_elements[focused_element_index].callback;
-    if (cb)
-        cb();
+    }
+
+    if (el->callback) el->callback();
+}
+
+/* ── Registro de widgets ────────────────────────────────────────────────── */
+/*
+ * Helper interno.  Solo toca campos estructurales; deja intactos text_buffer,
+ * text_len, is_checked y progress_value para que persistan entre frames.
+ */
+static int ui_push_base(int id, int x, int y, int w, int h,
+                        int type, UI_ElementCallback cb) {
+    UI_Element* e;
+    int idx;
+    if (ui_element_count >= UI_MAX_ELEMENTS) return -1;
+    idx = ui_element_count++;
+    e   = &ui_elements[idx];
+    e->id       = id;
+    e->x  = x; e->y = y; e->w = w; e->h = h;
+    e->type     = type;
+    e->callback = cb;
+    return idx;
+}
+
+static void ui_copy_str(char* dst, const char* src, int cap) {
+    int i = 0;
+    if (!src) { dst[0] = 0; return; }
+    while (i < cap - 1 && src[i]) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
+
+int ui_push_button(int id, int x, int y, int w, int h, UI_ElementCallback cb) {
+    return ui_push_base(id, x, y, w, h, UI_TYPE_BUTTON, cb);
+}
+
+int ui_push_text_input(int id, int x, int y, int w, int h, const char* placeholder) {
+    int idx = ui_push_base(id, x, y, w, h, UI_TYPE_TEXT_INPUT, 0);
+    if (idx >= 0) ui_copy_str(ui_elements[idx].placeholder, placeholder, 64);
+    return idx;
+}
+
+int ui_push_checkbox(int id, int x, int y, int w,
+                     const char* label, UI_ElementCallback cb) {
+    int idx = ui_push_base(id, x, y, w, 26, UI_TYPE_CHECKBOX, cb);
+    if (idx >= 0) ui_copy_str(ui_elements[idx].label, label, 64);
+    return idx;
+}
+
+int ui_push_progress_bar(int id, int x, int y, int w, int h, int value) {
+    int idx = ui_push_base(id, x, y, w, h, UI_TYPE_PROGRESS_BAR, 0);
+    if (idx >= 0) ui_elements[idx].progress_value = value;
+    return idx;
+}
+
+/* ── Renderizado de widgets ─────────────────────────────────────────────── */
+void ui_draw_element(int idx) {
+    UI_Element* e;
+    int focused;
+
+    if (idx < 0 || idx >= ui_element_count) return;
+    e       = &ui_elements[idx];
+    focused = (idx == focused_element_index);
+
+    switch (e->type) {
+
+    /* BUTTON: dibujado por installer_ui con draw_labeled_button; aquí no-op. */
+    case UI_TYPE_BUTTON:
+        break;
+
+    /* ── TEXT_INPUT ─────────────────────────────────────────────────────── */
+    case UI_TYPE_TEXT_INPUT: {
+        int pad_x = 10;
+        int ty    = e->y + (e->h - FONT_HQ_CELL_H) / 2;
+
+        /* Fondo */
+        gfx_fill_rounded_rect(e->x, e->y, e->w, e->h, 6, RGB(22, 26, 42));
+
+        /* Borde + focus ring */
+        if (focused) {
+            gfx_rounded_rect_stroke_aa(e->x - 3, e->y - 3,
+                                       e->w + 6, e->h + 6, 9,
+                                       ARGB(90, 0, 150, 220));
+            gfx_rounded_rect_stroke_aa(e->x, e->y, e->w, e->h, 6,
+                                       RGB(0, 150, 210));
+        } else {
+            gfx_rounded_rect_stroke_aa(e->x, e->y, e->w, e->h, 6,
+                                       RGB(55, 60, 85));
+        }
+
+        /* Contenido: texto o placeholder */
+        if (e->text_len > 0) {
+            /* Clip scroll: mostrar solo el sufijo que cabe */
+            const char* buf = e->text_buffer;
+            int avail = e->w - 2 * pad_x;
+            int start = 0;
+            int i;
+            char disp[256];
+
+            while (start < e->text_len) {
+                int tlen = e->text_len - start;
+                for (i = 0; i < tlen; i++) disp[i] = buf[start + i];
+                disp[i] = 0;
+                if (gfx_text_width_hq(disp) <= avail) break;
+                start++;
+            }
+            gfx_draw_text_hq(e->x + pad_x, ty, disp, RGB(220, 224, 240));
+
+            /* Cursor parpadeante al final del texto */
+            if (focused && ((ticks >> 9) & 1u)) {
+                int cx = e->x + pad_x + gfx_text_width_hq(disp);
+                gfx_fill_rect(cx, ty + 2, 2, FONT_HQ_CELL_H - 4,
+                              RGB(0, 180, 240));
+            }
+        } else {
+            /* Placeholder */
+            gfx_draw_text_hq(e->x + pad_x, ty, e->placeholder, RGB(75, 80, 108));
+            /* Cursor al inicio */
+            if (focused && ((ticks >> 9) & 1u)) {
+                gfx_fill_rect(e->x + pad_x, ty + 2, 2, FONT_HQ_CELL_H - 4,
+                              RGB(0, 180, 240));
+            }
+        }
+        break;
+    }
+
+    /* ── CHECKBOX ───────────────────────────────────────────────────────── */
+    case UI_TYPE_CHECKBOX: {
+        int bx = e->x, by = e->y;
+        int bs = 24; /* tamaño del cuadrado */
+        int ly = by + (bs - FONT_HQ_CELL_H) / 2;
+
+        if (e->is_checked) {
+            /* Relleno verde */
+            gfx_fill_rounded_rect(bx, by, bs, bs, 5, RGB(46, 180, 80));
+            gfx_rounded_rect_stroke_aa(bx, by, bs, bs, 5, RGB(20, 110, 45));
+            /* Check mark (V): trazo grueso doble para visibilidad) */
+            gfx_wu_line(bx + 4,  by + bs/2,      bx + bs/2 - 1, by + bs - 5, RGB(255, 255, 255));
+            gfx_wu_line(bx + 5,  by + bs/2 + 1,  bx + bs/2,     by + bs - 4, RGB(255, 255, 255));
+            gfx_wu_line(bx + bs/2 - 1, by + bs - 5,  bx + bs - 4, by + 4,    RGB(255, 255, 255));
+            gfx_wu_line(bx + bs/2,     by + bs - 4,  bx + bs - 3, by + 5,    RGB(255, 255, 255));
+        } else {
+            /* Fondo oscuro */
+            gfx_fill_rounded_rect(bx, by, bs, bs, 5, RGB(22, 26, 42));
+            if (focused) {
+                gfx_rounded_rect_stroke_aa(bx - 2, by - 2, bs + 4, bs + 4, 7,
+                                           ARGB(90, 0, 150, 220));
+                gfx_rounded_rect_stroke_aa(bx, by, bs, bs, 5, RGB(0, 150, 210));
+            } else {
+                gfx_rounded_rect_stroke_aa(bx, by, bs, bs, 5, RGB(55, 60, 85));
+            }
+        }
+
+        /* Etiqueta a la derecha */
+        if (e->label[0]) {
+            unsigned int col = focused ? RGB(230, 235, 255) : RGB(195, 200, 218);
+            gfx_draw_text_hq(bx + bs + 12, ly, e->label, col);
+        }
+        break;
+    }
+
+    /* ── PROGRESS_BAR ───────────────────────────────────────────────────── */
+    case UI_TYPE_PROGRESS_BAR: {
+        int pct = e->progress_value;
+        int bx = e->x, by = e->y, bw = e->w, bh = e->h;
+        int inner_w;
+        int r = bh / 2;
+
+        if (pct < 0)   pct = 0;
+        if (pct > 100) pct = 100;
+
+        /* Pista */
+        gfx_fill_rounded_rect(bx, by, bw, bh, r, RGB(20, 23, 36));
+        gfx_rounded_rect_stroke_aa(bx, by, bw, bh, r, RGB(45, 50, 72));
+
+        /* Relleno */
+        inner_w = (bw - 8) * pct / 100;
+        if (inner_w > 0) {
+            int ir = (bh - 8) / 2;
+            gfx_fill_rounded_rect(bx + 4, by + 4, inner_w, bh - 8, ir,
+                                  RGB(0, 122, 245));
+            /* Shimmer superior (brillo) */
+            gfx_blend_rect(bx + 4, by + 4, inner_w, (bh - 8) / 2,
+                           RGB(100, 200, 255), 55);
+        }
+
+        /* Porcentaje encima a la derecha */
+        {
+            char buf[8];
+            int  n = 0;
+            if (pct == 100) {
+                buf[n++] = '1'; buf[n++] = '0'; buf[n++] = '0';
+            } else if (pct >= 10) {
+                buf[n++] = (char)('0' + pct / 10);
+                buf[n++] = (char)('0' + pct % 10);
+            } else {
+                buf[n++] = (char)('0' + pct);
+            }
+            buf[n++] = '%'; buf[n] = 0;
+
+            gfx_draw_text_hq(bx + bw - gfx_text_width_hq(buf) - 6,
+                             by - FONT_HQ_CELL_H - 4,
+                             buf, RGB(0, 150, 210));
+        }
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+void ui_draw_all_elements(void) {
+    int i;
+    for (i = 0; i < ui_element_count; i++) {
+        if (ui_elements[i].type != UI_TYPE_BUTTON)
+            ui_draw_element(i);
+    }
+}
+
+/* ── Entrada de texto ───────────────────────────────────────────────────── */
+void ui_handle_char(unsigned char ch) {
+    UI_Element* el;
+    if (ui_element_count <= 0) return;
+    if (focused_element_index < 0 || focused_element_index >= ui_element_count) return;
+    el = &ui_elements[focused_element_index];
+    if (el->type != UI_TYPE_TEXT_INPUT) return;
+
+    if (ch == (unsigned char)'\b') {
+        if (el->text_len > 0) {
+            el->text_len--;
+            el->text_buffer[el->text_len] = 0;
+        }
+    } else if (ch >= 32u && ch < 127u && el->text_len < 255) {
+        el->text_buffer[el->text_len++] = (char)ch;
+        el->text_buffer[el->text_len]   = 0;
+    }
 }
