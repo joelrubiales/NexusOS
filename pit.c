@@ -21,6 +21,12 @@ void pit_init(void) {
     outb(0x40, (unsigned char)((divisor >> 8) & 0xFFu));
 }
 
+/*
+ * pit_irq_tick: incrementa ticks desde el handler de la IRQ0 clásico
+ * (timer_body). Cuando sched_timer_handler está activo (producción),
+ * sched_tick() hace el incremento directamente y esta función no se llama.
+ * Se conserva para pruebas unitarias y compatibilidad con código heredado.
+ */
 void pit_irq_tick(void) {
     ticks++;
 }

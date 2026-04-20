@@ -1,6 +1,7 @@
 #include "nexus.h"
 #include "pit.h"
 #include "keyboard.h"
+#include "task.h"
 
 struct idt_entry {
     unsigned short base_low;
@@ -23,6 +24,12 @@ static struct idt_ptr   idtp;
 volatile unsigned char tecla_nueva    = 0;
 volatile unsigned char tecla_extended = 0;
 static   volatile unsigned char _ext_pending = 0;
+
+/*
+ * timer_body: solo se usa mientras sched_timer_handler NO está en la IDT
+ * (es decir, nunca en producción; se conserva para pruebas unitarias aisladas).
+ * En el sistema normal, sched_timer_handler → sched_tick hace el tick + EOI.
+ */
 void timer_body(void) {
     pit_irq_tick();
     outb(0x20, 0x20);
@@ -49,6 +56,7 @@ extern void keyboard_handler(void);
 extern void mouse_handler(void);
 extern void irq_stub(void);
 extern void isr_halt(void);
+extern void sched_timer_handler(void);  /* IRQ0 preventivo (scheduler.asm) */
 
 static void set_idt_gate(int n, void (*handler)(void)) {
     unsigned long long addr = (unsigned long long)(__UINTPTR_TYPE__)handler;
@@ -81,11 +89,17 @@ void instalar_idt(void) {
     /* Unmask IRQ12 (mouse) on PIC2: bit4 = IRQ12 */
     outb(0xA1, 0xEF);
 
-    set_idt_gate(32, timer_handler);     /* IRQ0  -> INT 32 */
-    set_idt_gate(33, keyboard_handler);  /* IRQ1  -> INT 33 */
-    set_idt_gate(44, mouse_handler);     /* IRQ12 -> INT 44 */
+    /*
+     * IRQ0: usar el handler preventivo del scheduler.
+     * sched_tick() gestiona ticks++, EOI y el cambio de contexto.
+     * Mientras sched_enabled == 0, solo hace tick+EOI sin switch.
+     */
+    set_idt_gate(32, sched_timer_handler); /* IRQ0  -> INT 32 */
+    set_idt_gate(33, keyboard_handler);    /* IRQ1  -> INT 33 */
+    set_idt_gate(44, mouse_handler);       /* IRQ12 -> INT 44 */
 
     keyboard_init();
+    sched_init();
 
     __asm__ volatile("lidt %0" : : "m"(idtp));
     __asm__ volatile("sti");

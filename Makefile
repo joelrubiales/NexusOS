@@ -42,10 +42,10 @@ LIBGCC   := $(shell $(CC) $(CFLAGS) -print-libgcc-file-name)
 LDFLAGS  := -m elf_x86_64 -T linker.ld -nostdlib -static
 
 COBJS := kernel.o idt.o pit.o keyboard.o pantalla.o teclado.o pci.o nic.o vga.o gfx.o gui.o font8x8.o \
-	mouse.o memory.o paging.o kmalloc.o disk.o multitasking.o shell.o gui_installer.o vesa.o window.o desktop.o installer_ui.o mouse_gui.o \
+	mouse.o memory.o paging.o kmalloc.o disk.o multitasking.o scheduler.o shell.o gui_installer.o vesa.o window.o desktop.o installer_ui.o mouse_gui.o \
 	apps.o top_panel.o dock_icons.o icons_data.o
 SOBJ  := boot.o
-AOBJS := isr.o task_switch.o
+AOBJS := isr.o task_switch.o sched_switch.o
 OBJS  := $(SOBJ) $(COBJS) $(AOBJS)
 
 .PHONY: all clean dist clean-dist
