@@ -43,14 +43,26 @@ LDFLAGS  := -m elf_x86_64 -T linker.ld -nostdlib -static
 
 COBJS := kernel.o idt.o pit.o keyboard.o pantalla.o teclado.o pci.o nic.o vga.o gfx.o gui.o font8x8.o \
 	mouse.o memory.o paging.o kmalloc.o disk.o multitasking.o scheduler.o shell.o gui_installer.o vesa.o window.o desktop.o installer_ui.o mouse_gui.o \
-	apps.o top_panel.o dock_icons.o icons_data.o vfs.o event_system.o
+	apps.o top_panel.o dock_icons.o icons_data.o vfs.o event_system.o font_aa.o
 SOBJ  := boot.o
 AOBJS := isr.o task_switch.o sched_switch.o
-OBJS  := $(SOBJ) $(COBJS) $(AOBJS)
+OBJS  := $(SOBJ) $(COBJS) font_aa_data.o $(AOBJS)
 
 .PHONY: all clean dist clean-dist
 
 all: $(ISO_IMAGE)
+
+# ── Fuente AA: generación automática desde font8x8.c ─────────────────────
+# font_aa_data.h/.c se regeneran cuando cambia el script o la fuente 8×8.
+font_aa_data.c font_aa_data.h: gen_font_aa.py font8x8.c
+	python3 gen_font_aa.py
+
+# Todos los .o del kernel dependen del header generado para poder incluirlo.
+$(COBJS) font_aa_data.o: font_aa_data.h
+
+# Regla explícita para el .c generado (no sigue la regla %.o: %.c genérica).
+font_aa_data.o: font_aa_data.c font_aa_data.h
+	$(CC) $(CFLAGS) -c font_aa_data.c -o $@
 
 dist: $(ISO_IMAGE)
 	mkdir -p $(DIST_DIR)
@@ -93,6 +105,7 @@ clean:
 	rm -f $(OBJS) $(KERNEL_ELF) $(ISO_IMAGE)
 	rm -rf $(ISO_DIR)
 	rm -f kernel.bin
+	rm -f font_aa_data.c font_aa_data.h
 
 clean-dist:
 	rm -rf $(DIST_DIR)

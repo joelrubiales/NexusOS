@@ -21,7 +21,7 @@
 #include "gfx.h"
 #include "mouse.h"
 #include "nexus.h"
-#include "font_data.h"
+#include "font_aa.h"
 #include <stddef.h>
 
 /* Ancho de la barra lateral en píxeles lógicos. */
@@ -75,9 +75,9 @@ static void draw_labeled_button(int x, int y, int bw, int bh,
                                 const char* label,
                                 unsigned int bg, unsigned int stroke_rgb,
                                 int focused) {
-    int tw = gfx_text_width_hq(label);
+    int tw = gfx_aa_text_w(label, 1);
     int tx = x + (bw - tw) / 2;
-    int ty = y + (bh - FONT_HQ_CELL_H) / 2;
+    int ty = y + (bh - FONT_AA_GLYPH_H) / 2;
     if (focused) {
         gfx_rounded_rect_stroke_aa(x - 4, y - 4, bw + 8, bh + 8, 12,
                                    RGB(0, 255, 240));
@@ -86,7 +86,7 @@ static void draw_labeled_button(int x, int y, int bw, int bh,
     }
     gfx_fill_rounded_rect(x, y, bw, bh, 8, bg);
     gfx_rounded_rect_stroke_aa(x, y, bw, bh, 8, stroke_rgb);
-    gfx_draw_text_hq(tx, ty, label, RGB(255, 255, 255));
+    gfx_aa_text(tx, ty, label, RGB(255, 255, 255), 1);
 }
 
 static void draw_lang_option(int x, int y, int w, int h,
@@ -96,30 +96,30 @@ static void draw_lang_option(int x, int y, int w, int h,
     unsigned int border = selected ? RGB(0, 100, 220)   : RGB(190, 195, 210);
     gfx_fill_rounded_rect(x, y, w, h, 6, bg);
     gfx_rounded_rect_stroke_aa(x, y, w, h, 6, border);
-    gfx_draw_text_hq(x + 14, y + (h - FONT_HQ_CELL_H) / 2, name, fg);
+    gfx_aa_text(x + 14, y + (h - FONT_AA_GLYPH_H) / 2, name, fg, 1);
     if (selected)
-        gfx_draw_text_hq(x + w - 36, y + (h - FONT_HQ_CELL_H) / 2,
-                         "[*]", RGB(0, 120, 220));
+        gfx_aa_text(x + w - 36, y + (h - FONT_AA_GLYPH_H) / 2,
+                    "[*]", RGB(0, 120, 220), 1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  PASO 0 — WELCOME
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void draw_welcome(int cx, int cy, int cw, int ch) {
-    const char* headline   = "Bienvenido a NexusOS";
-    int         title_scale = 3;
-    int         tw  = gfx_text_width_aa(headline, title_scale);
+    const char* headline    = "Bienvenido a NexusOS";
+    int         title_scale = 2;
+    int         tw  = gfx_aa_text_w(headline, title_scale);
     int         tx  = cx + (cw - tw) / 2;
     int         ty  = cy + 24;
     if (tx < cx + 8) tx = cx + 8;
 
-    gfx_draw_text_aa(tx, ty, headline, RGB(28, 32, 44), title_scale);
-    gfx_draw_text_hq(cx + 24, ty + 28 * title_scale + 16,
-                     "Asistente de instalacion — Live CD",
-                     RGB(90, 95, 110));
+    gfx_aa_text(tx, ty, headline, RGB(28, 32, 44), title_scale);
+    gfx_aa_text(cx + 24, ty + gfx_aa_line_h(title_scale) + 8,
+                "Asistente de instalacion — Live CD",
+                RGB(90, 95, 110), 1);
 
     {
-        int ly  = ty + 28 * title_scale + 52;
+        int ly  = ty + gfx_aa_line_h(title_scale) + 44;
         int lh  = 36;
         int gap = 10;
         draw_lang_option(cx + 24, ly,                  cw - 48, lh, "Espanol (Espana)", 1);
@@ -149,27 +149,27 @@ static void draw_timezone_step(int cx, int cy, int cw, int ch) {
     int label_y, field_y;
     int fi;
 
-    gfx_draw_text_aa(cx + 20, cy + 16, "Configuracion del sistema",
-                     RGB(28, 32, 44), 2);
-    gfx_draw_text_hq(cx + 20, cy + 54,
-                     "Personaliza el nombre de tu equipo y cuenta de usuario.",
-                     RGB(80, 85, 100));
+    gfx_aa_text(cx + 20, cy + 16, "Configuracion del sistema",
+                RGB(28, 32, 44), 2);
+    gfx_aa_text(cx + 20, cy + 16 + gfx_aa_line_h(2) + 4,
+                "Personaliza el nombre de tu equipo y cuenta de usuario.",
+                RGB(80, 85, 100), 1);
 
     /* ── TEXT_INPUT: Nombre del equipo ───────────────────────────────── */
-    label_y  = cy + 94;
-    field_y  = label_y + FONT_HQ_CELL_H + 8;
+    label_y  = cy + 98;
+    field_y  = label_y + FONT_AA_GLYPH_H + 6;
 
-    gfx_draw_text_hq(field_x, label_y, "Nombre del equipo (hostname):",
-                     RGB(60, 65, 82));
+    gfx_aa_text(field_x, label_y, "Nombre del equipo (hostname):",
+                RGB(60, 65, 82), 1);
     fi = ui_push_text_input(10, field_x, field_y, field_w, field_h, "nexusos");
     (void)fi;
 
     /* ── TEXT_INPUT: Nombre de usuario ───────────────────────────────── */
     label_y  = field_y + field_h + 22;
-    field_y  = label_y + FONT_HQ_CELL_H + 8;
+    field_y  = label_y + FONT_AA_GLYPH_H + 6;
 
-    gfx_draw_text_hq(field_x, label_y, "Nombre de usuario:",
-                     RGB(60, 65, 82));
+    gfx_aa_text(field_x, label_y, "Nombre de usuario:",
+                RGB(60, 65, 82), 1);
     fi = ui_push_text_input(11, field_x, field_y, field_w, field_h, "usuario");
     (void)fi;
 
@@ -193,31 +193,31 @@ static void draw_disk_setup(int cx, int cy, int cw, int ch) {
     int disk_y = cy + 20;
     int disk_h = 72;
 
-    gfx_draw_text_aa(cx + 20, disk_y, "Destino de la instalacion",
-                     RGB(28, 32, 44), 2);
-    disk_y += 42;
+    gfx_aa_text(cx + 20, disk_y, "Destino de la instalacion",
+                RGB(28, 32, 44), 2);
+    disk_y += gfx_aa_line_h(2) + 6;
 
     /* Tarjeta del disco */
     gfx_fill_rounded_rect(cx + 20, disk_y, cw - 40, disk_h, 10, RGB(228, 232, 240));
     gfx_rounded_rect_stroke_aa(cx + 20, disk_y, cw - 40, disk_h, 10, RGB(140, 150, 175));
     gfx_fill_rounded_rect(cx + 36, disk_y + 16, 40, 40, 6, RGB(100, 110, 130));
     gfx_fill_rect(cx + 44, disk_y + 24, 24, 8, RGB(200, 205, 220));
-    gfx_draw_text_hq(cx + 88, disk_y + 18, "/dev/sda",               RGB(40, 44, 55));
-    gfx_draw_text_hq(cx + 88, disk_y + 40, "50 GB libres · ATA Disk", RGB(75, 80, 95));
+    gfx_aa_text(cx + 88, disk_y + 18, "/dev/sda",               RGB(40, 44, 55), 1);
+    gfx_aa_text(cx + 88, disk_y + 40, "50 GB libres · ATA Disk", RGB(75, 80, 95), 1);
 
     /* ── CHECKBOX 1: Formatear disco ──────────────────────────────────── */
     {
-        int oy  = disk_y + disk_h + 22;
-        int lbl_w = 24 + 12 + gfx_text_width_hq("Formatear disco completo (/dev/sda)");
-        int fi  = ui_push_checkbox(20, cx + 20, oy, lbl_w,
-                                   "Formatear disco completo (/dev/sda)", NULL);
+        int oy    = disk_y + disk_h + 22;
+        int lbl_w = 24 + 12 + gfx_aa_text_w("Formatear disco completo (/dev/sda)", 1);
+        int fi    = ui_push_checkbox(20, cx + 20, oy, lbl_w,
+                                     "Formatear disco completo (/dev/sda)", NULL);
         (void)fi;
     }
 
     /* ── CHECKBOX 2: Instalar gestor de arranque ──────────────────────── */
     {
-        int oy  = disk_y + disk_h + 22 + 26 + 14;
-        int lbl_w = 24 + 12 + gfx_text_width_hq("Instalar gestor de arranque GRUB");
+        int oy    = disk_y + disk_h + 22 + 26 + 14;
+        int lbl_w = 24 + 12 + gfx_aa_text_w("Instalar gestor de arranque GRUB", 1);
         int fi  = ui_push_checkbox(21, cx + 20, oy, lbl_w,
                                    "Instalar gestor de arranque GRUB", NULL);
         /* Pre-marcar como activo en el primer frame (is_checked se preserva después) */
@@ -265,11 +265,11 @@ static void draw_installing(int cx, int cy, int cw, int ch) {
         return;
     }
 
-    gfx_draw_text_aa(cx + 20, cy + 16, "Instalando NexusOS",
-                     RGB(28, 32, 44), 2);
-    gfx_draw_text_hq(cx + 20, cy + 48,
-                     "No apague el equipo durante la instalacion.",
-                     RGB(100, 55, 55));
+    gfx_aa_text(cx + 20, cy + 16, "Instalando NexusOS",
+                RGB(28, 32, 44), 2);
+    gfx_aa_text(cx + 20, cy + 16 + gfx_aa_line_h(2) + 4,
+                "No apague el equipo durante la instalacion.",
+                RGB(100, 55, 55), 1);
 
     /* ── PROGRESS_BAR widget ───────────────────────────────────────── */
     bar_x = cx + 32;
@@ -287,14 +287,16 @@ static void draw_installing(int cx, int cy, int cw, int ch) {
     gfx_rounded_rect_stroke_aa(cx + 20, log_y, cw - 40, ch - (log_y - cy) - 16,
                                 6, RGB(60, 65, 78));
     {
-        int ly = log_y + 10;
-        gfx_draw_text_aa(cx + 28, ly,     "> copiando archivos del sistema...", RGB(180, 220, 180), 1); ly += 16;
-        gfx_draw_text_aa(cx + 28, ly,     "> configurando initramfs...",        RGB(160, 200, 160), 1); ly += 16;
-        gfx_draw_text_aa(cx + 28, ly,     "> instalando GRUB...",               RGB(140, 180, 140), 1); ly += 16;
-        if (pct >= 18) { gfx_draw_text_aa(cx + 28, ly, "> extrayendo squashfs...", RGB(120, 170, 120), 1); ly += 16; }
-        if (pct >= 40) { gfx_draw_text_aa(cx + 28, ly, "> generando fstab...",    RGB(100, 160, 100), 1); ly += 16; }
-        if (pct >= 62) { gfx_draw_text_aa(cx + 28, ly, "> sincronizando disco...", RGB(90, 150, 90),  1); ly += 16; }
-        if (pct >= 82) { gfx_draw_text_aa(cx + 28, ly, "> finalizando...",         RGB(80, 145, 90),  1); }
+        int step = gfx_aa_line_h(1);
+        int ly   = log_y + 10;
+        gfx_aa_text(cx + 28, ly, "> copiando archivos del sistema...", RGB(180, 220, 180), 1); ly += step;
+        gfx_aa_text(cx + 28, ly, "> configurando initramfs...",        RGB(160, 200, 160), 1); ly += step;
+        gfx_aa_text(cx + 28, ly, "> instalando GRUB...",               RGB(140, 180, 140), 1); ly += step;
+        if (pct >= 18) { gfx_aa_text(cx + 28, ly, "> extrayendo squashfs...", RGB(120, 170, 120), 1); ly += step; }
+        if (pct >= 40) { gfx_aa_text(cx + 28, ly, "> generando fstab...",    RGB(100, 160, 100), 1); ly += step; }
+        if (pct >= 62) { gfx_aa_text(cx + 28, ly, "> sincronizando disco...", RGB(90, 150, 90),  1); ly += step; }
+        if (pct >= 82) { gfx_aa_text(cx + 28, ly, "> finalizando...",         RGB(80, 145, 90),  1); }
+        (void)ly;
     }
 }
 
@@ -315,14 +317,14 @@ static void draw_finished(int cx, int cy, int cw, int ch) {
     gfx_wu_line(mx - 4, my + 14, mx + 22, my - 18, RGB(255, 255, 255));
 
     y  = my + 52;
-    tw = gfx_text_width_aa(l1, 2);
-    gfx_draw_text_aa(mx - tw/2, y, l1, RGB(28, 32, 44), 2);
-    y += 36;
-    tw = gfx_text_width_hq(l2);
-    gfx_draw_text_hq(cx + (cw - tw)/2, y, l2, RGB(55, 60, 72));
-    y += 22;
-    tw = gfx_text_width_hq(l3);
-    gfx_draw_text_hq(cx + (cw - tw)/2, y, l3, RGB(55, 60, 72));
+    tw = gfx_aa_text_w(l1, 2);
+    gfx_aa_text(mx - tw/2, y, l1, RGB(28, 32, 44), 2);
+    y += gfx_aa_line_h(2);
+    tw = gfx_aa_text_w(l2, 1);
+    gfx_aa_text(cx + (cw - tw)/2, y, l2, RGB(55, 60, 72), 1);
+    y += gfx_aa_line_h(1);
+    tw = gfx_aa_text_w(l3, 1);
+    gfx_aa_text(cx + (cw - tw)/2, y, l3, RGB(55, 60, 72), 1);
 
     {
         int bw = 170, bh = 42;
@@ -356,8 +358,8 @@ static void draw_installer_sidebar(int sx, int sy, int sw, int sh) {
         gfx_circle_outline_aa(dot_cx, logo_y + dot_r, dot_r, RGB(80, 160, 255));
 
         /* Nombre */
-        gfx_draw_text_aa(dot_cx + dot_r + 8, logo_y + 1, "NexusOS",
-                         RGB(235, 240, 255), 1);
+        gfx_aa_text(dot_cx + dot_r + 8, logo_y + 1, "NexusOS",
+                    RGB(235, 240, 255), 1);
     }
 
     /* ── Línea divisoria tras el logo ────────────────────────────────── */
@@ -423,8 +425,8 @@ static void draw_installer_sidebar(int sx, int sy, int sw, int sh) {
                                 is_current ? RGB(220, 235, 255) :
                                              SIDEBAR_DIM;
             int text_x = dot_cx + STEP_DOT_R + 8;
-            int text_y = item_y + STEP_DOT_R - FONT_HQ_CELL_H / 2;
-            gfx_draw_text_hq(text_x, text_y, step_labels[i], tcol);
+            int text_y = item_y + STEP_DOT_R - FONT_AA_GLYPH_H / 2;
+            gfx_aa_text(text_x, text_y, step_labels[i], tcol, 1);
         }
 
         item_y += step_gap;
