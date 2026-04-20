@@ -30,6 +30,7 @@ typedef struct UI_Element {
     char text_buffer[256];      /* contenido actual (null-terminado) */
     int  text_len;              /* == strlen(text_buffer) */
     char placeholder[64];       /* texto gris cuando text_buffer está vacío */
+    int  is_password;           /* 1 = mostrar '*' (contenido real en text_buffer) */
 
     /* CHECKBOX ───────────────────────────────────────────────────────── */
     int  is_checked;
@@ -60,7 +61,8 @@ void ui_activate_focused(void);
 /* ── Registro de widgets ──────────────────────────────────────────────── */
 /* Nota: no borra state (text_buffer, is_checked) para preservarlo entre frames. */
 int  ui_push_button      (int id, int x, int y, int w, int h, UI_ElementCallback cb);
-int  ui_push_text_input  (int id, int x, int y, int w, int h, const char* placeholder);
+int  ui_push_text_input  (int id, int x, int y, int w, int h, const char* placeholder,
+                          int is_password);
 int  ui_push_checkbox    (int id, int x, int y, int w, const char* label, UI_ElementCallback cb);
 int  ui_push_progress_bar(int id, int x, int y, int w, int h, int value);
 

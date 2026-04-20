@@ -763,9 +763,13 @@ int ui_push_button(int id, int x, int y, int w, int h, UI_ElementCallback cb) {
     return ui_push_base(id, x, y, w, h, UI_TYPE_BUTTON, cb);
 }
 
-int ui_push_text_input(int id, int x, int y, int w, int h, const char* placeholder) {
+int ui_push_text_input(int id, int x, int y, int w, int h, const char* placeholder,
+                       int is_password) {
     int idx = ui_push_base(id, x, y, w, h, UI_TYPE_TEXT_INPUT, 0);
-    if (idx >= 0) ui_copy_str(ui_elements[idx].placeholder, placeholder, 64);
+    if (idx >= 0) {
+        ui_copy_str(ui_elements[idx].placeholder, placeholder, 64);
+        ui_elements[idx].is_password = is_password ? 1 : 0;
+    }
     return idx;
 }
 
@@ -821,19 +825,32 @@ void ui_draw_element(int idx) {
         if (e->text_len > 0) {
             /* Clip scroll: mostrar solo el sufijo que cabe */
             const char* buf = e->text_buffer;
-            int avail = e->w - 2 * pad_x;
+            int avail = e->w - 2 * pad_x - (e->is_password ? 30 : 0);
             int start = 0;
             int i;
             char disp[256];
 
             while (start < e->text_len) {
                 int tlen = e->text_len - start;
-                for (i = 0; i < tlen; i++) disp[i] = buf[start + i];
-                disp[i] = 0;
+                if (e->is_password) {
+                    for (i = 0; i < tlen; i++) disp[i] = '*';
+                    disp[i] = 0;
+                } else {
+                    for (i = 0; i < tlen; i++) disp[i] = buf[start + i];
+                    disp[i] = 0;
+                }
                 if (gfx_text_width_hq(disp) <= avail) break;
                 start++;
             }
             gfx_draw_text_hq(e->x + pad_x, ty, disp, RGB(220, 224, 240));
+
+            /* Icono "ojo" simple (GTK): revelar que hay campo oculto) */
+            if (e->is_password) {
+                int ex = e->x + e->w - 28;
+                int ey = e->y + e->h / 2;
+                gfx_circle_outline_aa(ex, ey, 7, RGB(120, 130, 160));
+                gfx_fill_circle(ex, ey, 3, RGB(220, 224, 240));
+            }
 
             /* Cursor parpadeante al final del texto */
             if (focused && ((ticks >> 9) & 1u)) {
