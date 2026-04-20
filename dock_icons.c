@@ -1,6 +1,7 @@
 #include "dock_icons.h"
 #include "gfx.h"
 #include "icons.h"
+#include "vfs.h"
 
 static void icon_system_detailed(int x, int y, int s) {
     int ox = x + s * 18 / 100, oy = y + s * 15 / 100, bw = s * 64 / 100, bh = s * 55 / 100;
@@ -27,9 +28,26 @@ static void icon_power_detailed(int x, int y, int s) {
     gfx_vline(cx, y + s * 12 / 100, s * 28 / 100, RGB(255, 255, 255));
 }
 
+/*
+ * Intenta usar el icono del VFS (initrd:/icons/<id>.bmp) a tamaño arbitrario
+ * escalando con gfx_blit_scaled. Si no existe o el VFS no está listo, cae al
+ * renderer geométrico nativo.
+ */
 void dock_icon_draw(int id, int x, int y, int size) {
     int ox, oy;
     if (size < 16) size = 16;
+
+    /* Intentar icono VFS (carga en cache la primera vez, después zero-cost). */
+    if (vfs_ready()) {
+        int iw = 0, ih = 0;
+        const uint32_t* bmp = vfs_get_icon(id, &iw, &ih);
+        if (bmp && iw > 0 && ih > 0) {
+            gfx_blit_scaled(x, y, size, size, bmp, iw, ih);
+            return;
+        }
+    }
+
+    /* Fallback: renderers geométricos nativos (siempre disponibles). */
     ox = (size - ICON_RGBA_W) / 2;
     oy = (size - ICON_RGBA_H) / 2;
     if (id == 0) {

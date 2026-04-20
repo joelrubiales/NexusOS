@@ -14,6 +14,7 @@
 #include "boot_info.h"
 #include "shell.h"
 #include "gui_installer.h"
+#include "vfs.h"
 #include <stddef.h>
 
 /* 1 = sin startx; 0 = escritorio tras consola VESA. */
@@ -28,6 +29,7 @@
 #define MB2_TAG_END                 0u
 #define MB2_TAG_CMDLINE             1u
 #define MULTIBOOT_TAG_TYPE_CMDLINE  1u /* alias spec Multiboot2 */
+#define MB2_TAG_MODULE              3u
 #define MB2_TAG_FRAMEBUFFER         8u
 
 int boot_mode = 0;
@@ -90,6 +92,44 @@ static void mb2_parse_cmdline(uint32_t mbi_phys, char* buf, size_t cap) {
 static void mb2_hang(void) {
     __asm__ volatile("cli");
     for (;;) __asm__ volatile("hlt");
+}
+
+/*
+ * Extrae el primer módulo GRUB (tag tipo 3 de la MBI).
+ * mod_start / mod_end son direcciones físicas del payload.
+ * Devuelve 1 si encontró al menos un módulo, 0 en caso contrario.
+ */
+static int mb2_parse_module(uint32_t mbi_phys, uint32_t* mod_start, uint32_t* mod_end) {
+    const volatile uint32_t* m = (const volatile uint32_t*)(uintptr_t)mbi_phys;
+    uint32_t total_size;
+    size_t off;
+
+    *mod_start = *mod_end = 0;
+    if (mbi_phys == 0 || (mbi_phys & 7u) != 0) return 0;
+
+    total_size = m[0];
+    if (total_size < 16u || total_size > (4u * 1024u * 1024u)) return 0;
+
+    for (off = 8; off + 8 <= (size_t)total_size;) {
+        const volatile uint32_t* tag = (const volatile uint32_t*)(uintptr_t)(mbi_phys + off);
+        uint32_t tag_type = tag[0];
+        uint32_t tag_size = tag[1];
+        size_t   next;
+
+        if (tag_size < 8u) break;
+        next = ((size_t)tag_size + 7u) & ~(size_t)7u;
+        if (next == 0) break;
+
+        /* Tag tipo 3: uint32 mod_start, uint32 mod_end, char name[]. */
+        if (tag_type == MB2_TAG_MODULE && tag_size >= 16u) {
+            *mod_start = tag[2];
+            *mod_end   = tag[3];
+            return 1;
+        }
+        if (tag_type == MB2_TAG_END) break;
+        off += next;
+    }
+    return 0;
 }
 
 /* Recorre tags (type, size) en la Multiboot2 Information Structure; tag 8 = framebuffer. */
@@ -353,6 +393,18 @@ void kernel_main(uint32_t magic, uint32_t mb2_info_addr) {
 
     /* Tags de GRUB: no asignar esas páginas con kmalloc / PMM. */
     pmm_reserve_multiboot_info(mb2_info_addr);
+
+    /* Módulo initrd (tag 3): reservar en el PMM y montar el VFS. */
+    {
+        uint32_t mod_start = 0, mod_end = 0;
+        if (mb2_parse_module(mb2_info_addr, &mod_start, &mod_end) && mod_end > mod_start) {
+            uint32_t mod_sz = mod_end - mod_start;
+            pmm_reserve_phys_range((uintptr_t)mod_start, (size_t)mod_sz);
+            vfs_init(mod_start, mod_end);
+        } else {
+            vfs_init(0, 0);  /* Sin initrd: VFS vacío, los fallbacks dibujan de forma nativa. */
+        }
+    }
 
     /* Inmediatamente tras el handoff gráfico: PML4 + tablas 4 KiB, identidad sobre toda la VRAM. */
     memory_map_framebuffer_identity(info->lfb_ptr, info->pitch, info->height,

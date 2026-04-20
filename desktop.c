@@ -4,6 +4,7 @@
 #include "installer_ui.h"
 #include "dock_icons.h"
 #include "font_data.h"
+#include "vfs.h"
 
 #define DOCK_BG 0x00383C52u
 
@@ -179,6 +180,21 @@ void desktop_paint_wallpaper_layer(void) {
     int sw = screen_width;
     int sh = screen_height;
     if (sw < 1 || sh < 1) return;
+
+    /* Intentar wallpaper desde el VFS (initrd:/background.bmp). */
+    if (vfs_ready()) {
+        int bw = 0, bh = 0;
+        const uint32_t* bmp = vfs_get_wallpaper(&bw, &bh);
+        if (bmp && bw > 0 && bh > 0) {
+            gfx_blit_scaled(0, 0, sw, sh, bmp, bw, bh);
+            /* Velos suaves para integrar el dock y la barra de título. */
+            gfx_blend_rect(0, 0, sw, sh / 14, RGB(0, 8, 30), 55);
+            gfx_blend_rect(0, sh - sh / 10, sw, sh / 10, RGB(10, 0, 20), 50);
+            return;
+        }
+    }
+
+    /* Fallback: degradado vectorial (sin initrd o BMP no encontrado). */
     gfx_gradient_v(0, 0, sw, sh, RGB(8, 18, 52), RGB(72, 34, 96));
     gfx_blend_rect(0, 0, sw, sh / 12, RGB(0, 10, 40), 45);
     gfx_blend_rect(0, sh - sh / 10, sw, sh / 10, RGB(20, 0, 30), 40);

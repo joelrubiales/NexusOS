@@ -84,6 +84,13 @@ void gfx_rounded_rect_stroke_aa(int x, int y, int w, int h, int corner_r, unsign
 /* RGBA 0xAARRGGBB por píxel, fila mayor a menor (top-left origin) */
 void gfx_draw_image_rgba(int x, int y, int w, int h, const unsigned int* argb);
 
+/*
+ * Nearest-neighbor scale-blit: copia src (sw×sh, 0xAARRGGBB) al backbuffer
+ * escalando a (dx,dy,dw,dh).  Ideal para wallpapers desde el VFS.
+ */
+void gfx_blit_scaled(int dx, int dy, int dw, int dh,
+                     const uint32_t* src, int sw, int sh);
+
 /* Texto HQ (16×24 celda): supersampling + subpixel ligero */
 void gfx_draw_text_hq(int x, int y, const char* s, unsigned int fg);
 int  gfx_text_width_hq(const char* s);

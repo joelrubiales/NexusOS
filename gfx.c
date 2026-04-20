@@ -862,6 +862,35 @@ void gfx_rect_mica(int x, int y, int w, int h, int corner_r, unsigned int tint, 
     }
 }
 
+/* ── Blit escalado (nearest-neighbor) ───────────────────────────────────── */
+/*
+ * Copia la imagen src (sw×sh píxeles, formato 0xAARRGGBB) al backbuffer
+ * escalando al rectángulo de destino (dx,dy,dw,dh) con interpolación de
+ * vecino más cercano.  Útil para pintar wallpapers y sprites de cualquier
+ * tamaño sin reservas adicionales de memoria.
+ */
+void gfx_blit_scaled(int dx, int dy, int dw, int dh,
+                     const uint32_t* src, int sw, int sh) {
+    int y, x;
+    if (!backbuf || !src || dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return;
+
+    for (y = 0; y < dh; y++) {
+        int abs_y = dy + y;
+        int sy    = y * sh / dh;
+        if (abs_y < 0 || abs_y >= scr_h) continue;
+
+        const uint32_t* srow = src + (size_t)(unsigned)sy * (size_t)(unsigned)sw;
+        uint32_t* drow = backbuf + (size_t)(unsigned)abs_y * (size_t)(unsigned)fb_stride;
+
+        for (x = 0; x < dw; x++) {
+            int abs_x = dx + x;
+            int sx    = x * sw / dw;
+            if (abs_x < 0 || abs_x >= scr_w) continue;
+            drow[abs_x] = srow[sx];
+        }
+    }
+}
+
 /* ── Mouse cursor (12x16 arrow with shadow) ──────────────────────── */
 void gfx_draw_cursor(int cx, int cy) {
     static const unsigned short shape[16] = {

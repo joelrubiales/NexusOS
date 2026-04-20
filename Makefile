@@ -43,7 +43,7 @@ LDFLAGS  := -m elf_x86_64 -T linker.ld -nostdlib -static
 
 COBJS := kernel.o idt.o pit.o keyboard.o pantalla.o teclado.o pci.o nic.o vga.o gfx.o gui.o font8x8.o \
 	mouse.o memory.o paging.o kmalloc.o disk.o multitasking.o scheduler.o shell.o gui_installer.o vesa.o window.o desktop.o installer_ui.o mouse_gui.o \
-	apps.o top_panel.o dock_icons.o icons_data.o
+	apps.o top_panel.o dock_icons.o icons_data.o vfs.o
 SOBJ  := boot.o
 AOBJS := isr.o task_switch.o sched_switch.o
 OBJS  := $(SOBJ) $(COBJS) $(AOBJS)
@@ -66,6 +66,11 @@ BOOT_GRUB_CFG := boot/grub/grub.cfg
 $(ISO_DIR)/boot/grub/grub.cfg: $(BOOT_GRUB_CFG) | $(ISO_DIR)/boot/grub
 	cp -f $(BOOT_GRUB_CFG) $@
 
+# Initrd: genera los assets BMP y los empaqueta en un USTAR TAR.
+INITRD := $(ISO_DIR)/boot/initrd.tar
+$(INITRD): gen_initrd.py | $(ISO_DIR)/boot/grub
+	python3 gen_initrd.py $@
+
 boot.o: boot.S multiboot2_asm.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -81,7 +86,7 @@ $(KERNEL_ELF): $(OBJS) linker.ld
 $(KERNEL_BIN): $(KERNEL_ELF) | $(ISO_DIR)/boot/grub
 	cp -f $(KERNEL_ELF) $(KERNEL_BIN)
 
-$(ISO_IMAGE): $(KERNEL_BIN) $(ISO_DIR)/boot/grub/grub.cfg
+$(ISO_IMAGE): $(KERNEL_BIN) $(ISO_DIR)/boot/grub/grub.cfg $(INITRD)
 	grub-mkrescue -o $(ISO_IMAGE) $(ISO_DIR)
 
 clean:
