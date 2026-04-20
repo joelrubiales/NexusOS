@@ -52,6 +52,18 @@ void gfx_hline(int x, int y, int w, unsigned int color);
 void gfx_vline(int x, int y, int h, unsigned int color);
 void gfx_fill_rounded_rect(int x, int y, int w, int h, int r, unsigned int color);
 
+/*
+ * gfx_fill_rounded_rect_aa — versión con anti-aliasing sub-píxel.
+ * argb: 0xAARRGGBB  (alpha 0 = opaco, 1-254 = translúcido, 255 = opaco rápido).
+ */
+void gfx_fill_rounded_rect_aa(int x, int y, int w, int h, int r, uint32_t argb);
+
+/*
+ * blend_colors — mezcla alpha-over de dos colores 0xAARRGGBB.
+ * Devuelve 0x00RRGGBB (byte alpha = 0, listo para escribir al framebuffer).
+ */
+uint32_t blend_colors(uint32_t fg, uint32_t bg);
+
 /* Text (8x8 bitmap font) */
 void gfx_draw_char(int x, int y, unsigned char ch, unsigned int fg, unsigned int bg);
 void gfx_draw_text(int x, int y, const char* s, unsigned int fg, unsigned int bg);

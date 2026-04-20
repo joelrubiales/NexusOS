@@ -7,6 +7,14 @@
  *   DISK_SETUP → destino + CHECKBOXes de opciones de disco.
  *   INSTALLING → PROGRESS_BAR animado + log de consola.
  *   FINISHED   → círculo check + botón Reiniciar.
+ *
+ * DISEÑO VISUAL:
+ *   La ventana se divide en dos zonas:
+ *     • Barra lateral izquierda (SIDEBAR_W px): panel de navegación con
+ *       80 % de opacidad sobre el fondo blanco de la ventana, lista de pasos
+ *       y logotipo del SO.
+ *     • Área de contenido (resto): tarjeta blanca con bordes redondeados (AA),
+ *       sombra difusa y degradado de encabezado.
  */
 #include "installer_ui.h"
 #include "gui.h"
@@ -15,6 +23,26 @@
 #include "nexus.h"
 #include "font_data.h"
 #include <stddef.h>
+
+/* Ancho de la barra lateral en píxeles lógicos. */
+#define SIDEBAR_W_MIN  100
+#define SIDEBAR_W_MAX  200
+#define SIDEBAR_W_FRAC 4   /* 1/4 del ancho del contenido */
+
+/* Colores de la barra lateral (dark navy, ~80 % opacidad). */
+#define SIDEBAR_BG_RGB   RGB(14, 21, 45)
+#define SIDEBAR_BG_ALPHA 204u          /* 204/255 ≈ 80 % */
+#define SIDEBAR_ACCENT   RGB(0, 120, 220)
+#define SIDEBAR_TEXT     RGB(195, 205, 230)
+#define SIDEBAR_DONE     RGB(50, 180, 80)
+#define SIDEBAR_DIM      RGB(80, 100, 145)
+
+/* Radio del círculo de indicador de paso. */
+#define STEP_DOT_R 7
+
+/* Colores de la tarjeta de contenido. */
+#define CARD_RADIUS  14
+#define CARD_SHADOW  10   /* spread de sombra */
 
 InstallerState current_step = WELCOME;
 
@@ -308,6 +336,106 @@ static void draw_finished(int cx, int cy, int cw, int ch) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ *  Barra lateral — lista de pasos con indicadores visuales.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void draw_installer_sidebar(int sx, int sy, int sw, int sh) {
+    /* ── Fondo: 80 % de opacidad de navy sobre el blanco de la ventana ── */
+    gfx_blend_rect(sx, sy, sw, sh, SIDEBAR_BG_RGB, SIDEBAR_BG_ALPHA);
+
+    /* ── Franja acentuada en el borde superior ─────────────────────── */
+    gfx_fill_rect(sx, sy, sw, 3, SIDEBAR_ACCENT);
+
+    /* ── Logotipo / nombre del SO ────────────────────────────────────── */
+    {
+        int logo_y = sy + 18;
+        int dot_r  = 8;
+        int dot_cx = sx + dot_r + 14;
+
+        /* Círculo coloreado (logo simplificado) */
+        gfx_fill_circle(dot_cx, logo_y + dot_r, dot_r, SIDEBAR_ACCENT);
+        gfx_circle_outline_aa(dot_cx, logo_y + dot_r, dot_r, RGB(80, 160, 255));
+
+        /* Nombre */
+        gfx_draw_text_aa(dot_cx + dot_r + 8, logo_y + 1, "NexusOS",
+                         RGB(235, 240, 255), 1);
+    }
+
+    /* ── Línea divisoria tras el logo ────────────────────────────────── */
+    gfx_blend_rect(sx + 12, sy + 44, sw - 24, 1, RGB(80, 110, 175), 120);
+
+    /* ── Lista de pasos ──────────────────────────────────────────────── */
+    static const char* step_labels[] = {
+        "Bienvenida", "Sistema", "Disco", "Instalando", "Completado"
+    };
+    static const InstallerState step_ids[] = {
+        WELCOME, TIMEZONE, DISK_SETUP, INSTALLING, FINISHED
+    };
+    const int n_steps  = 5;
+    const int step_gap = (sh - 60) / n_steps;   /* espacio vertical entre pasos */
+    int item_y = sy + 60;
+
+    for (int i = 0; i < n_steps; i++) {
+        InstallerState sid = step_ids[i];
+        int is_current  = (current_step == sid);
+        int is_done     = (int)current_step > (int)sid;
+
+        int dot_cx = sx + 18;
+        int dot_cy = item_y + STEP_DOT_R;
+
+        /* ── Fondo resaltado para el paso actual ─────────────────────── */
+        if (is_current) {
+            gfx_blend_rect(sx + 4, item_y - 4,
+                           sw - 8, STEP_DOT_R * 2 + 10,
+                           RGB(0, 80, 180), 70);
+        }
+
+        /* ── Indicador (círculo) ─────────────────────────────────────── */
+        if (is_done) {
+            gfx_fill_circle(dot_cx, dot_cy, STEP_DOT_R, SIDEBAR_DONE);
+            /* Checkmark simplificado */
+            gfx_wu_line(dot_cx - 4, dot_cy,
+                        dot_cx - 1, dot_cy + 3, RGB(255, 255, 255));
+            gfx_wu_line(dot_cx - 1, dot_cy + 3,
+                        dot_cx + 5, dot_cy - 4, RGB(255, 255, 255));
+        } else if (is_current) {
+            gfx_fill_circle(dot_cx, dot_cy, STEP_DOT_R, SIDEBAR_ACCENT);
+            gfx_circle_outline_aa(dot_cx, dot_cy, STEP_DOT_R, RGB(100, 180, 255));
+            /* Punto interior blanco */
+            gfx_fill_circle(dot_cx, dot_cy, 3, RGB(255, 255, 255));
+        } else {
+            /* Pendiente: sólo contorno */
+            gfx_circle_outline_aa(dot_cx, dot_cy, STEP_DOT_R, SIDEBAR_DIM);
+            gfx_blend_pixel(dot_cx, dot_cy, RGB(60, 80, 120), 120);
+        }
+
+        /* ── Conector vertical entre indicadores ─────────────────────── */
+        if (i < n_steps - 1) {
+            int conn_y0 = dot_cy + STEP_DOT_R + 2;
+            int conn_y1 = item_y + step_gap - STEP_DOT_R - 2;
+            unsigned int conn_col = is_done ? SIDEBAR_DONE : SIDEBAR_DIM;
+            for (int yy = conn_y0; yy < conn_y1; yy++)
+                gfx_blend_pixel(dot_cx, yy, conn_col, is_done ? 180 : 80);
+        }
+
+        /* ── Etiqueta de texto ───────────────────────────────────────── */
+        {
+            unsigned int tcol = is_done    ? SIDEBAR_DONE  :
+                                is_current ? RGB(220, 235, 255) :
+                                             SIDEBAR_DIM;
+            int text_x = dot_cx + STEP_DOT_R + 8;
+            int text_y = item_y + STEP_DOT_R - FONT_HQ_CELL_H / 2;
+            gfx_draw_text_hq(text_x, text_y, step_labels[i], tcol);
+        }
+
+        item_y += step_gap;
+    }
+
+    /* ── Borde derecho de separación ─────────────────────────────────── */
+    for (int yy = sy; yy < sy + sh; yy++)
+        gfx_blend_pixel(sx + sw - 1, yy, RGB(60, 90, 160), 100);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  *  Punto de entrada: repintar el contenido del instalador (llamado cada frame).
  * ═══════════════════════════════════════════════════════════════════════════ */
 void draw_installer_content(const Window* win) {
@@ -318,7 +446,7 @@ void draw_installer_content(const Window* win) {
     installer_client_rect(win, &cx, &cy, &cw, &ch);
     if (cw < 80 || ch < 60) return;
 
-    /* Resetear lista de widgets cada frame. */
+    /* ── Resetear lista de widgets cada frame ────────────────────────── */
     ui_element_count = 0;
     if (current_step != last_step) {
         focused_element_index = 0;
@@ -327,7 +455,82 @@ void draw_installer_content(const Window* win) {
     if (current_step != INSTALLING)
         install_timer_armed = 0;
 
-    /* Dibujar el contenido del paso actual (que también registra los widgets). */
+    /* ── Calcular ancho de la barra lateral ──────────────────────────── */
+    int sidebar_w = cw / SIDEBAR_W_FRAC;
+    if (sidebar_w > SIDEBAR_W_MAX) sidebar_w = SIDEBAR_W_MAX;
+    if (sidebar_w < SIDEBAR_W_MIN) sidebar_w = 0;  /* ocultar en pantallas pequeñas */
+
+    /* ── 1. Barra lateral ────────────────────────────────────────────── */
+    if (sidebar_w > 0)
+        draw_installer_sidebar(cx, cy, sidebar_w, ch);
+
+    /* ── 2. Tarjeta de contenido principal ───────────────────────────── */
+    {
+        int card_x  = cx + sidebar_w + 6;
+        int card_y  = cy + 6;
+        int card_w  = cw - sidebar_w - 12;
+        int card_h  = ch - 12;
+
+        if (card_w < 80 || card_h < 60)
+            goto draw_content_fallback;
+
+        /* Sombra difusa detrás de la tarjeta. */
+        gfx_drop_shadow_soft(card_x, card_y, card_w, card_h, CARD_RADIUS, CARD_SHADOW);
+
+        /* Superficie de la tarjeta: blanco puro con esquinas AA. */
+        gfx_fill_rounded_rect_aa(card_x, card_y, card_w, card_h,
+                                  CARD_RADIUS, RGB(252, 253, 255));
+
+        /* Franja de encabezado superior con degradado sutil. */
+        {
+            int hdr_h = 40;
+            for (int yy = 0; yy < hdr_h; yy++) {
+                /* De blanco casi puro a blanco con tinte frío leve. */
+                uint32_t col = gfx_lerp_rgb(RGB(245, 247, 255),
+                                             RGB(252, 253, 255), yy, hdr_h);
+                gfx_hline(card_x + CARD_RADIUS, card_y + yy,
+                          card_w - 2 * CARD_RADIUS, col);
+            }
+            /* Reflejar el degradado en las esquinas superiores redondeadas. */
+            for (int yy = 0; yy < CARD_RADIUS && yy < hdr_h; yy++) {
+                uint32_t col = gfx_lerp_rgb(RGB(245, 247, 255),
+                                             RGB(252, 253, 255), yy, hdr_h);
+                for (int xx = 0; xx < CARD_RADIUS; xx++) {
+                    int cdx = CARD_RADIUS - 1 - xx;
+                    int cdy = CARD_RADIUS - 1 - yy;
+                    if (cdx * cdx + cdy * cdy <= CARD_RADIUS * CARD_RADIUS)
+                        gfx_put_pixel(card_x + xx,            card_y + yy, col);
+                    if (cdx * cdx + cdy * cdy <= CARD_RADIUS * CARD_RADIUS)
+                        gfx_put_pixel(card_x + card_w - 1 - xx, card_y + yy, col);
+                }
+            }
+        }
+
+        /* Borde sutil alrededor de la tarjeta (1 px, gris muy claro). */
+        gfx_rounded_rect_stroke_aa(card_x, card_y, card_w, card_h,
+                                    CARD_RADIUS, RGB(215, 218, 230));
+
+        /* Área interior utilizable por el contenido del paso. */
+        int inner_x = card_x + 4;
+        int inner_y = card_y + 4;
+        int inner_w = card_w - 8;
+        int inner_h = card_h - 8;
+
+        /* ── 3. Contenido del paso actual ────────────────────────────── */
+        switch (current_step) {
+        case WELCOME:    draw_welcome       (inner_x, inner_y, inner_w, inner_h); break;
+        case TIMEZONE:   draw_timezone_step (inner_x, inner_y, inner_w, inner_h); break;
+        case DISK_SETUP: draw_disk_setup    (inner_x, inner_y, inner_w, inner_h); break;
+        case INSTALLING: draw_installing    (inner_x, inner_y, inner_w, inner_h); break;
+        case FINISHED:   draw_finished      (inner_x, inner_y, inner_w, inner_h); break;
+        default: break;
+        }
+
+        goto after_content;
+    }
+
+draw_content_fallback:
+    /* Pantalla demasiado pequeña: sin tarjeta, layout original. */
     switch (current_step) {
     case WELCOME:    draw_welcome       (cx, cy, cw, ch); break;
     case TIMEZONE:   draw_timezone_step (cx, cy, cw, ch); break;
@@ -337,9 +540,10 @@ void draw_installer_content(const Window* win) {
     default: break;
     }
 
+after_content:
     /*
      * Dibujar todos los widgets no-BUTTON (TEXT_INPUT, CHECKBOX, PROGRESS_BAR).
-     * Se hace DESPUÉS del switch para que aparezcan encima del fondo de cada paso.
+     * Se hace DESPUÉS del switch para que aparezcan encima del fondo del paso.
      */
     ui_draw_all_elements();
 }

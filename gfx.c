@@ -275,16 +275,59 @@ void gfx_clear(unsigned int color) {
     }
 }
 
+/*
+ * blend_colors — combina fg y bg usando el canal alfa de fg.
+ *
+ * Formato de entrada/salida: 0xAARRGGBB (o 0x00RRGGBB para opaco).
+ * El resultado devuelto tiene el byte de alpha a 0 (listo para escribir).
+ *
+ * Convención de alpha:
+ *   0   → completamente transparente → devuelve bg puro
+ *   255 → completamente opaco       → devuelve fg (sin leer bg)
+ *   1-254 → mezcla proporcional (alpha over)
+ */
+uint32_t blend_colors(uint32_t fg, uint32_t bg) {
+    unsigned int a  = (fg >> 24) & 0xFFu;
+    if (a == 0u)   return bg  & 0x00FFFFFFu;
+    if (a == 255u) return fg  & 0x00FFFFFFu;
+    unsigned int fr = (fg >> 16) & 0xFFu,  fg2 = (fg >> 8) & 0xFFu,  fb = fg & 0xFFu;
+    unsigned int br = (bg >> 16) & 0xFFu,  bg2 = (bg >> 8) & 0xFFu,  bb = bg & 0xFFu;
+    unsigned int inv = 255u - a;
+    return (((fr * a + br * inv) / 255u) << 16u)
+         | (((fg2 * a + bg2 * inv) / 255u) << 8u)
+         |  ((fb  * a + bb  * inv) / 255u);
+}
+
+/*
+ * gfx_put_pixel — escribe un píxel en el backbuffer.
+ *
+ * Semántica del byte alpha (bits 31-24):
+ *   0        → opaco (colores RGB() con byte alpha 0; mantiene compatibilidad histórica).
+ *   1 - 254  → mezcla alpha over sobre el píxel actual del backbuffer.
+ *   255      → opaco (escritura directa sin leer el fondo).
+ *
+ * El byte alpha se elimina antes de escribir al framebuffer (32 bpp no usa alpha).
+ */
 void gfx_put_pixel(int x, int y, unsigned int color) {
     if ((unsigned)x >= (unsigned)scr_w || (unsigned)y >= (unsigned)scr_h || !backbuf)
         return;
-    /* Double buffer: double_buffer[y * (pitch/4) + x] = color; */
+
+    {
+        unsigned int a = (color >> 24) & 0xFFu;
+        if (a > 0u && a < 255u) {
+            /* Alpha parcial: leer fondo y mezclar. */
+            color = blend_colors((uint32_t)color, (uint32_t)gfx_get_pixel(x, y));
+        }
+        color &= 0x00FFFFFFu;   /* quitar byte alpha antes de escribir */
+    }
+
     if (scr_bpp == 32) {
         uint32_t* db = (uint32_t*)backbuf;
         size_t stride_u32 = (size_t)(unsigned)(scr_pitch / 4);
         db[(size_t)(unsigned)y * stride_u32 + (size_t)(unsigned)x] = (uint32_t)color;
-    } else
+    } else {
         backbuf[y * fb_stride + x] = color;
+    }
 }
 
 void gfx_fill_rect(int x, int y, int w, int h, unsigned int color) {
@@ -372,6 +415,96 @@ void gfx_fill_rounded_rect(int x, int y, int w, int h, int r, unsigned int color
                 gfx_put_pixel(x+w-1-dx, y+dy, color);
                 gfx_put_pixel(x+dx, y+h-1-dy, color);
                 gfx_put_pixel(x+w-1-dx, y+h-1-dy, color);
+            }
+        }
+    }
+}
+
+/*
+ * gfx_fill_rounded_rect_aa — rectángulo redondeado relleno con AA sub-píxel.
+ *
+ * Parámetros:
+ *   argb  — color en formato 0xAARRGGBB ó 0x00RRGGBB (alpha=0 → opaco).
+ *
+ * Comportamiento:
+ *   • Interior (3 bandas): `gfx_fill_rect` (opaco) o `gfx_blend_rect` (translúcido).
+ *   • Arcos de esquina: cobertura continua según la distancia al centro del arco,
+ *     interpolando entre (r-1)² y r² → transición suave de 1 pixel de ancho.
+ */
+void gfx_fill_rounded_rect_aa(int x, int y, int w, int h, int r, uint32_t argb) {
+    if (!backbuf || w <= 0 || h <= 0) return;
+    if (r < 0) r = 0;
+    if (r > h / 2) r = h / 2;
+    if (r > w / 2) r = w / 2;
+
+    unsigned int a   = (argb >> 24) & 0xFFu;
+    unsigned int rgb = argb & 0x00FFFFFFu;
+    /* alpha 0 ≡ opaco para compatibilidad con colores RGB(). */
+    unsigned int eff = (a == 0u) ? 255u : a;
+
+    /* ── Bandas interiores ───────────────────────────────────────────── */
+    if (eff >= 255u) {
+        gfx_fill_rect(x + r,     y,     w - 2 * r, h,       rgb);
+        gfx_fill_rect(x,         y + r, r,          h - 2*r, rgb);
+        gfx_fill_rect(x + w - r, y + r, r,          h - 2*r, rgb);
+    } else {
+        gfx_blend_rect(x + r,     y,     w - 2 * r, h,       rgb, eff);
+        gfx_blend_rect(x,         y + r, r,          h - 2*r, rgb, eff);
+        gfx_blend_rect(x + w - r, y + r, r,          h - 2*r, rgb, eff);
+    }
+
+    if (r == 0) return;
+
+    /* ── Esquinas con cobertura sub-píxel ────────────────────────────── */
+    {
+        int fr = (int)((rgb >> 16) & 0xFFu);
+        int fg = (int)((rgb >>  8) & 0xFFu);
+        int fb = (int)( rgb        & 0xFFu);
+
+        int r2     = r * r;
+        int r2_in  = (r > 1) ? (r - 1) * (r - 1) : 0;
+        int range  = r2 - r2_in;
+        if (range < 1) range = 1;
+
+        for (int dy = 0; dy < r; dy++) {
+            for (int dx = 0; dx < r; dx++) {
+                /* Distancia desde el borde exterior del pixel al centro del arco. */
+                int cdx   = r - 1 - dx;
+                int cdy   = r - 1 - dy;
+                int dist2 = cdx * cdx + cdy * cdy;
+
+                unsigned int pa;
+                if      (dist2 <= r2_in) pa = eff;
+                else if (dist2 >  r2)    continue;  /* fuera del círculo */
+                else    pa = (unsigned int)((r2 - dist2) * (int)eff / range);
+
+                if (pa == 0u) continue;
+
+                /* Las 4 esquinas simétricas. */
+                if (pa >= 255u) {
+                    gfx_put_pixel(x + dx,         y + dy,          rgb);
+                    gfx_put_pixel(x + w - 1 - dx, y + dy,          rgb);
+                    gfx_put_pixel(x + dx,         y + h - 1 - dy,  rgb);
+                    gfx_put_pixel(x + w - 1 - dx, y + h - 1 - dy,  rgb);
+                } else {
+                    /* Mezcla lineal manual (evita re-leer alpha en gfx_blend_pixel). */
+                    unsigned int inv2 = 255u - pa;
+                    unsigned int bx0, bx1, bx2, bx3;
+
+                    bx0 = gfx_get_pixel(x + dx,         y + dy);
+                    bx1 = gfx_get_pixel(x + w - 1 - dx, y + dy);
+                    bx2 = gfx_get_pixel(x + dx,         y + h - 1 - dy);
+                    bx3 = gfx_get_pixel(x + w - 1 - dx, y + h - 1 - dy);
+
+#define BLEND1(bg) ( ((((unsigned)(fr)*pa + (((bg)>>16)&0xFFu)*inv2)/255u)<<16u) \
+                   | ((((unsigned)(fg)*pa + (((bg)>> 8)&0xFFu)*inv2)/255u)<< 8u) \
+                   |  (((unsigned)(fb)*pa + ( (bg)     &0xFFu)*inv2)/255u) )
+                    gfx_put_pixel(x + dx,         y + dy,         BLEND1(bx0));
+                    gfx_put_pixel(x + w - 1 - dx, y + dy,         BLEND1(bx1));
+                    gfx_put_pixel(x + dx,         y + h - 1 - dy, BLEND1(bx2));
+                    gfx_put_pixel(x + w - 1 - dx, y + h - 1 - dy,BLEND1(bx3));
+#undef BLEND1
+                }
             }
         }
     }
