@@ -2,6 +2,7 @@
 #define NEXUS_VFS_H
 
 #include <stdint.h>
+#include "tar.h"  /* VFS_Node, tar_total_payload_bytes, tar_next_entry */
 
 /*
  * VFS mínimo de NexusOS.

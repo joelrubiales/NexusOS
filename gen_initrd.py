@@ -222,6 +222,81 @@ def gen_icon_power() -> bytes:
     return make_bmp32(32, 32, px)
 
 
+# ─── Archivos de sistema falsos para el instalador ────────────────────────
+#
+# Generan datos pseudo-aleatorios de tamaño realista para que el instalador
+# tarde ~7 s al iterar el TAR a 2 KiB/frame × 30 fps ≈ 60 KiB/s.
+# Total de payload de sistema: ~200 KiB + ~215 KiB (BMPs) = ~415 KiB.
+
+def fake_bin(size: int) -> bytes:
+    """Relleno cíclico 0-255; generación O(n/256), sin módulos externos."""
+    chunk = bytes(range(256))
+    return (chunk * (size // 256)) + bytes(range(size % 256))
+
+
+SYSTEM_FILES: list[tuple[str, bytes]] = [
+    # bin/
+    ("bin/bash",                fake_bin(20_480)),
+    ("bin/ls",                  fake_bin(8_192)),
+    ("bin/cat",                 fake_bin(5_120)),
+    ("bin/grep",                fake_bin(10_240)),
+    ("bin/cp",                  fake_bin(6_144)),
+    ("bin/mv",                  fake_bin(6_144)),
+    ("bin/rm",                  fake_bin(5_120)),
+    ("bin/mkdir",               fake_bin(4_096)),
+    ("bin/chmod",               fake_bin(4_096)),
+    ("bin/chown",               fake_bin(4_096)),
+    # lib/
+    ("lib/libc.so.6",           fake_bin(49_152)),
+    ("lib/libm.so.6",           fake_bin(24_576)),
+    ("lib/libpthread.so.0",     fake_bin(12_288)),
+    ("lib/ld-linux-x86-64.so.2",fake_bin(8_192)),
+    # etc/
+    ("etc/fstab",
+        b"# /etc/fstab\n"
+        b"/dev/sda1  /      ext4  defaults  1 1\n"
+        b"/dev/sda2  swap   swap  defaults  0 0\n"
+        b"tmpfs      /tmp   tmpfs defaults  0 0\n"),
+    ("etc/hostname",            b"nexusos\n"),
+    ("etc/passwd",
+        b"root:x:0:0:root:/root:/bin/nexusbash\n"
+        b"user:x:1000:1000:User:/home/user:/bin/nexusbash\n"
+        b"nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"),
+    ("etc/shadow",
+        b"root:*:19000:0:99999:7:::\n"
+        b"user:*:19000:0:99999:7:::\n"),
+    ("etc/nexus_config",
+        b"hostname=nexusos\n"
+        b"user=user\n"
+        b"lang=en_US.UTF-8\n"
+        b"timezone=UTC+0\n"
+        b"keyboard=us\n"
+        b"shell=/bin/nexusbash\n"
+        b"arch=x86_64\n"
+        b"edition=gaming\n"
+        b"desktop=nexus-desktop\n"
+        b"version=3.0.0\n"),
+    ("etc/grub/grub.cfg",
+        b"set default=0\nset timeout=5\n"
+        b'menuentry "NexusOS 3.0" {\n'
+        b"  multiboot2 /boot/kernel.bin\n"
+        b"  module2    /boot/initrd.tar\n"
+        b"}\n"),
+    # usr/
+    ("usr/bin/python3",         fake_bin(24_576)),
+    ("usr/bin/nano",            fake_bin(16_384)),
+    ("usr/lib/nexus/core.so",   fake_bin(20_480)),
+    # boot/
+    ("boot/vmlinuz-nexus",      fake_bin(36_864)),
+    ("boot/System.map",         fake_bin(4_096)),
+    # var/
+    ("var/log/install.log",
+        b"[NexusOS Installer]\n"
+        b"version=3.0.0\n"
+        b"status=complete\n"),
+]
+
+
 # ─── Empaquetar en TAR ─────────────────────────────────────────────────────
 def add_to_tar(tf: tarfile.TarFile, name: str, data: bytes):
     buf = io.BytesIO(data)
@@ -247,6 +322,15 @@ def main():
     # parser de vfs.c. El formato PAX (default Python 3.8+) añade bloques
     # extendidos que complican el walker innecesariamente para archivos pequeños.
     with tarfile.open(out, "w:", format=tarfile.USTAR_FORMAT) as tf:
+        # ── Archivos de sistema (aparecen primero en el log del instalador) ──
+        total_sys = 0
+        for name, data in SYSTEM_FILES:
+            print(f"  → {name} ({len(data)} B) ...", end=" ", flush=True)
+            add_to_tar(tf, name, data)
+            total_sys += len(data)
+            print("OK")
+
+        # ── Assets gráficos del escritorio ──────────────────────────────────
         print(f"  → background.bmp (256×192) ...", end=" ", flush=True)
         add_to_tar(tf, "background.bmp", gen_wallpaper(256, 192))
         print("OK")
@@ -259,6 +343,7 @@ def main():
 
     stat = os.stat(out)
     print(f"\nInitrd: {out}  ({stat.st_size // 1024} KiB)")
+    print(f"  Sistema: {total_sys // 1024} KiB de archivos de sistema")
 
 
 if __name__ == "__main__":

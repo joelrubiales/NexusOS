@@ -1,4 +1,5 @@
 #include "vfs.h"
+#include "tar.h"
 #include "memory.h"
 #include <stddef.h>
 
@@ -53,6 +54,8 @@ void vfs_init(uint32_t mod_start, uint32_t mod_end) {
     if (mod_start == 0 || mod_end <= mod_start) return;
     initrd_base = (const uint8_t*)(uintptr_t)mod_start;
     initrd_size = mod_end - mod_start;
+    /* Inicializar el módulo TAR con la misma región de memoria. */
+    tar_init(initrd_base, initrd_size);
 }
 
 int vfs_ready(void) { return initrd_base != NULL; }

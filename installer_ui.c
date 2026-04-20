@@ -22,6 +22,7 @@
 #include "mouse.h"
 #include "nexus.h"
 #include "font_aa.h"
+#include "vfs.h"
 #include <stddef.h>
 
 /* Ancho de la barra lateral en píxeles lógicos. */
@@ -55,11 +56,95 @@ static void cb_reboot(void) {
     for (;;) __asm__ volatile("hlt");
 }
 
-/* ~10 s reales a 1000 Hz (PIT IRQ0). */
-#define INSTALL_DURATION_TICKS (10ull * (uint64_t)PIT_TICKS_PER_SEC)
+/* ── Motor de extracción TAR ─────────────────────────────────────────────── */
+/*
+ * Avanza 2 KiB por frame × 30 fps ≈ 60 KiB/s.
+ * Con ~415 KiB de payload (sistema + assets) → ~7 s de instalación.
+ */
+#define EXTRACT_BYTES_PER_FRAME 2048u
+#define EXTRACT_LOG_N           7
 
+/* Offset en el TAR (avanza cuando se termina de "extraer" un archivo). */
+static uint32_t extr_tar_off      = 0;
+/* Bytes totales en el TAR (calculado al inicio de la instalación). */
+static uint32_t extr_total        = 0;
+/* Bytes "extraídos" hasta ahora. */
+static uint32_t extr_done         = 0;
+/* Bytes que quedan por extraer del archivo actual. */
+static uint32_t extr_remain       = 0;
+/* Porcentaje 0–100. */
+static int      extr_pct          = 0;
+/* 1 cuando se han procesado todos los archivos. */
+static int      extr_complete     = 0;
+/* 0 = necesita reiniciar la próxima vez que entremos en INSTALLING. */
+static int      extr_init_done    = 0;
+
+/* Ring buffer de líneas de log. */
+static char extr_log[EXTRACT_LOG_N][120];
+static int  extr_log_start = 0;   /* índice del registro más antiguo */
+static int  extr_log_count = 0;   /* número de registros válidos */
+
+/* Fallback con ticks para cuando no hay initrd. */
+#define INSTALL_DURATION_TICKS (10ull * (uint64_t)PIT_TICKS_PER_SEC)
 static uint64_t install_start_tick;
 static int      install_timer_armed;
+
+/* ── Helpers de extracción ────────────────────────────────────────────────── */
+
+/* Añade una nueva entrada al ring buffer del log ("> copiando: <name>"). */
+static void extr_log_push(const char* name) {
+    char*       dst;
+    int         di = 0, i;
+    const char* prefix = "> copiando: ";
+    int         slot;
+
+    if (extr_log_count < EXTRACT_LOG_N) {
+        slot = (extr_log_start + extr_log_count) % EXTRACT_LOG_N;
+        extr_log_count++;
+    } else {
+        /* Sobreescribir la entrada más antigua. */
+        slot = extr_log_start;
+        extr_log_start = (extr_log_start + 1) % EXTRACT_LOG_N;
+    }
+    dst = extr_log[slot];
+    for (i = 0; prefix[i] && di < 118; i++) dst[di++] = prefix[i];
+    for (i = 0; name[i]   && di < 118; i++) dst[di++] = name[i];
+    dst[di] = '\0';
+}
+
+/* Avanza la extracción en EXTRACT_BYTES_PER_FRAME bytes. */
+static void extr_advance_frame(void) {
+    uint32_t  advance;
+    VFS_Node  node;
+
+    if (extr_complete) return;
+
+    if (extr_remain == 0) {
+        /* Pasar al siguiente archivo del TAR. */
+        if (tar_next_entry(&extr_tar_off, &node)) {
+            extr_remain = (node.size > 0) ? node.size : 1u;
+            extr_log_push(node.name);
+        } else {
+            /* Fin del TAR — instalación completa. */
+            extr_complete = 1;
+            extr_done     = extr_total;
+            extr_pct      = 100;
+            return;
+        }
+    }
+
+    /* Consumir EXTRACT_BYTES_PER_FRAME del archivo actual. */
+    advance = (extr_remain > EXTRACT_BYTES_PER_FRAME)
+                  ? EXTRACT_BYTES_PER_FRAME
+                  : extr_remain;
+    extr_remain -= advance;
+    extr_done   += advance;
+
+    if (extr_total > 0) {
+        extr_pct = (int)((uint64_t)extr_done * 100u / extr_total);
+        if (extr_pct > 99) extr_pct = 99;   /* 100 % solo al completar */
+    }
+}
 
 /* ── Helpers de layout ───────────────────────────────────────────────────── */
 static void installer_client_rect(const Window* w,
@@ -247,55 +332,97 @@ static void draw_disk_setup(int cx, int cy, int cw, int ch) {
  *  Widget: PROGRESS_BAR + log de consola.
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void draw_installing(int cx, int cy, int cw, int ch) {
-    int     pct;
-    int     bar_x, bar_y, bar_w, bar_h;
-    int     log_y;
-    uint64_t elapsed;
+    int bar_x, bar_y, bar_w, bar_h, log_y;
 
-    if (!install_timer_armed) {
-        install_start_tick = ticks;
-        install_timer_armed = 1;
-    }
-    elapsed = ticks - install_start_tick;
-    pct = (int)(elapsed * 100 / INSTALL_DURATION_TICKS);
-    if (pct > 100) pct = 100;
-    if (pct >= 100) {
-        current_step        = FINISHED;
-        install_timer_armed = 0;
-        return;
+    /* ── Inicializar el motor de extracción (primera llamada) ───────── */
+    if (!extr_init_done) {
+        extr_init_done  = 1;
+        extr_tar_off    = 0;
+        extr_done       = 0;
+        extr_remain     = 0;
+        extr_pct        = 0;
+        extr_complete   = 0;
+        extr_log_start  = 0;
+        extr_log_count  = 0;
+        extr_total      = tar_total_payload_bytes();
+
+        /* Fallback con ticks si no hay initrd cargado. */
+        if (extr_total == 0) {
+            install_start_tick  = ticks;
+            install_timer_armed = 1;
+        }
     }
 
+    /* ── Avanzar la extracción un frame ─────────────────────────────── */
+    if (extr_total > 0) {
+        extr_advance_frame();
+
+        if (extr_complete) {
+            current_step    = FINISHED;
+            extr_init_done  = 0;
+            install_timer_armed = 0;
+            return;
+        }
+    } else {
+        /* Fallback: progreso basado en ticks (sin initrd). */
+        uint64_t elapsed = ticks - install_start_tick;
+        extr_pct = (int)(elapsed * 100 / INSTALL_DURATION_TICKS);
+        if (extr_pct > 100) extr_pct = 100;
+        if (extr_pct >= 100) {
+            current_step        = FINISHED;
+            install_timer_armed = 0;
+            return;
+        }
+    }
+
+    /* ── Renderizar ─────────────────────────────────────────────────── */
     gfx_aa_text(cx + 20, cy + 16, "Instalando NexusOS",
                 RGB(28, 32, 44), 2);
     gfx_aa_text(cx + 20, cy + 16 + gfx_aa_line_h(2) + 4,
                 "No apague el equipo durante la instalacion.",
                 RGB(100, 55, 55), 1);
 
-    /* ── PROGRESS_BAR widget ───────────────────────────────────────── */
+    /* ── PROGRESS_BAR ───────────────────────────────────────────────── */
     bar_x = cx + 32;
     bar_y = cy + ch / 2 - 50;
     bar_w = cw - 64;
     bar_h = 26;
     if (bar_w < 80) bar_w = 80;
+    ui_push_progress_bar(30, bar_x, bar_y, bar_w, bar_h, extr_pct);
 
-    /* Registrar widget con el progreso actual (se renderiza en ui_draw_all_elements) */
-    ui_push_progress_bar(30, bar_x, bar_y, bar_w, bar_h, pct);
-
-    /* ── Log de consola ──────────────────────────────────────────────── */
+    /* ── Log de consola con archivos reales del TAR ─────────────────── */
     log_y = bar_y + bar_h + 36;
-    gfx_fill_rect(cx + 20, log_y, cw - 40, ch - (log_y - cy) - 16, RGB(24, 26, 32));
+    gfx_fill_rect(cx + 20, log_y, cw - 40, ch - (log_y - cy) - 16,
+                  RGB(24, 26, 32));
     gfx_rounded_rect_stroke_aa(cx + 20, log_y, cw - 40, ch - (log_y - cy) - 16,
                                 6, RGB(60, 65, 78));
     {
+        /*
+         * Colores degradados: entrada más antigua (top) = tenue,
+         * más reciente (bottom) = brillante.
+         */
+        static const unsigned int log_cols[EXTRACT_LOG_N] = {
+            RGB(60, 105, 60),  RGB(75, 120, 75),  RGB(90, 135, 90),
+            RGB(110, 155, 110), RGB(135, 175, 135), RGB(158, 198, 158),
+            RGB(180, 220, 180)
+        };
         int step = gfx_aa_line_h(1);
         int ly   = log_y + 10;
-        gfx_aa_text(cx + 28, ly, "> copiando archivos del sistema...", RGB(180, 220, 180), 1); ly += step;
-        gfx_aa_text(cx + 28, ly, "> configurando initramfs...",        RGB(160, 200, 160), 1); ly += step;
-        gfx_aa_text(cx + 28, ly, "> instalando GRUB...",               RGB(140, 180, 140), 1); ly += step;
-        if (pct >= 18) { gfx_aa_text(cx + 28, ly, "> extrayendo squashfs...", RGB(120, 170, 120), 1); ly += step; }
-        if (pct >= 40) { gfx_aa_text(cx + 28, ly, "> generando fstab...",    RGB(100, 160, 100), 1); ly += step; }
-        if (pct >= 62) { gfx_aa_text(cx + 28, ly, "> sincronizando disco...", RGB(90, 150, 90),  1); ly += step; }
-        if (pct >= 82) { gfx_aa_text(cx + 28, ly, "> finalizando...",         RGB(80, 145, 90),  1); }
+        int i;
+
+        if (extr_log_count > 0) {
+            for (i = 0; i < extr_log_count; i++) {
+                int slot  = (extr_log_start + i) % EXTRACT_LOG_N;
+                int ci    = (EXTRACT_LOG_N - extr_log_count) + i;
+                unsigned int col = (ci >= 0 && ci < EXTRACT_LOG_N)
+                                   ? log_cols[ci] : log_cols[EXTRACT_LOG_N - 1];
+                gfx_aa_text(cx + 28, ly, extr_log[slot], col, 1);
+                ly += step;
+            }
+        } else {
+            gfx_aa_text(cx + 28, ly, "> iniciando instalacion...",
+                        log_cols[EXTRACT_LOG_N - 1], 1);
+        }
         (void)ly;
     }
 }
@@ -454,8 +581,10 @@ void draw_installer_content(const Window* win) {
         focused_element_index = 0;
         last_step             = current_step;
     }
-    if (current_step != INSTALLING)
+    if (current_step != INSTALLING) {
         install_timer_armed = 0;
+        extr_init_done      = 0;   /* reiniciar si se re-entra en INSTALLING */
+    }
 
     /* ── Calcular ancho de la barra lateral ──────────────────────────── */
     int sidebar_w = cw / SIDEBAR_W_FRAC;
