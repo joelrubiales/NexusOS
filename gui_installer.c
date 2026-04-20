@@ -1,5 +1,10 @@
 /*
  * Instalador gráfico de arranque: inicialización del escritorio y asistente (installer_ui).
+ *
+ * ARQUITECTURA DE EVENTOS:
+ *   start_gui_installer() ya no sondea mouse_buttons ni tecla_nueva directamente.
+ *   En cada frame consume todos los Event* del ring buffer y despacha la
+ *   lógica interactiva exclusivamente dentro del switch(ev.type).
  */
 #include "gui_installer.h"
 #include "gui.h"
@@ -9,6 +14,7 @@
 #include "mouse.h"
 #include "nexus.h"
 #include "window.h"
+#include "event.h"
 #include <stdint.h>
 
 extern volatile uint64_t ticks;
@@ -77,32 +83,91 @@ void init_desktop(void) {
 }
 
 void start_gui_installer(void) {
-    uint64_t        last_frame = 0;
-    unsigned char   prev_btns  = 0;
+    uint64_t last_frame = 0;
+
+    /* Descartar eventos acumulados durante el arranque. */
+    flush_events();
 
     for (;;) {
+        /* ── Limitar a ~30 fps (ticks a 1000 Hz → esperar ≥2 ticks) ─── */
         if (ticks - last_frame < 2) {
             __asm__ volatile("hlt");
             continue;
         }
         last_frame = ticks;
 
-        gfx_layout_refresh();
-        installer_paint_frame();
-
+        /* ════════════════════════════════════════════════════════════════
+         * BUCLE DE MENSAJES — procesar TODOS los eventos pendientes antes
+         * de redibujar el frame.
+         * ════════════════════════════════════════════════════════════════ */
         {
-            unsigned char btns = mouse_buttons;
-            int           click = (btns & 1) && !(prev_btns & 1);
-            prev_btns           = btns;
-            if (click && ui_element_count > 0) {
-                int hit = ui_get_element_at((int)mouse_x, (int)mouse_y);
-                if (hit >= 0) {
-                    focused_element_index = hit;
-                    ui_activate_focused();
+            Event ev;
+            while (pop_event(&ev)) {
+                switch (ev.type) {
+
+                /* ── Movimiento de ratón: actualizar foco hover ──────── */
+                case EVENT_MOUSE_MOVE:
+                    if (ui_element_count > 0)
+                        ui_update_focus_from_mouse(ev.mouse_x, ev.mouse_y);
+                    break;
+
+                /* ── Clic de ratón: activar elemento bajo el cursor ──── */
+                case EVENT_MOUSE_CLICK:
+                    if (ev.mouse_pressed && (ev.mouse_buttons & 1) &&
+                        ui_element_count > 0) {
+                        int hit = ui_get_element_at(ev.mouse_x, ev.mouse_y);
+                        if (hit >= 0) {
+                            focused_element_index = hit;
+                            ui_activate_focused();
+                        }
+                    }
+                    break;
+
+                /* ── Tecla pulsada ───────────────────────────────────── */
+                case EVENT_KEY_PRESS:
+                    if (ui_element_count > 0 &&
+                        focused_element_index >= 0 &&
+                        focused_element_index < ui_element_count &&
+                        ui_elements[focused_element_index].type == UI_TYPE_TEXT_INPUT) {
+
+                        /* Dentro de un TEXT_INPUT */
+                        if (ev.scancode == 0x0Eu) {
+                            /* Backspace */
+                            ui_handle_char('\b');
+                        } else if (ev.scancode == 0x0Fu || ev.scancode == 0x1Cu) {
+                            /* TAB / Enter: avanzar foco */
+                            ui_focus_advance();
+                        } else if (ev.ascii >= 32) {
+                            /* Carácter imprimible */
+                            ui_handle_char((unsigned char)ev.ascii);
+                        }
+
+                    } else if (ui_element_count > 0) {
+
+                        /* Navegación general entre widgets */
+                        if (ev.scancode == 0x0Fu) {
+                            /* TAB: siguiente elemento */
+                            ui_focus_advance();
+                        } else if (ev.scancode == 0x1Cu) {
+                            /* Enter: activar elemento enfocado */
+                            ui_activate_focused();
+                        }
+                    }
+                    break;
+
+                case EVENT_WINDOW_CLOSE:
+                    /* El instalador no gestiona cierres de ventana. */
+                    break;
+
+                default:
+                    break;
                 }
             }
         }
 
+        /* ── Renderizar frame ────────────────────────────────────────── */
+        gfx_layout_refresh();
+        installer_paint_frame();
         gfx_draw_cursor(mouse_x, mouse_y);
         swap_buffers();
     }

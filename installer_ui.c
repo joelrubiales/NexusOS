@@ -342,7 +342,4 @@ void draw_installer_content(const Window* win) {
      * Se hace DESPUÉS del switch para que aparezcan encima del fondo de cada paso.
      */
     ui_draw_all_elements();
-
-    /* Sincronizar foco con la posición del ratón. */
-    ui_update_focus_from_mouse((int)mouse_x, (int)mouse_y);
 }

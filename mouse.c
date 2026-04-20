@@ -11,6 +11,7 @@
 #include "mouse.h"
 #include "gfx.h"
 #include "nexus.h"
+#include "event.h"
 
 volatile int mouse_x = 0;
 volatile int mouse_y = 0;
@@ -174,6 +175,7 @@ void mouse_body(void) {
         mouse_byte[2] = data;
         mouse_cycle   = 0;
 
+        unsigned char old_buttons = mouse_buttons;
         mouse_buttons = mouse_byte[0] & 0x07;
 
         int dx = (int)mouse_byte[1];
@@ -187,6 +189,38 @@ void mouse_body(void) {
             mouse_x += dx;
             mouse_y -= dy;
             mouse_apply_limits();
+
+            /* ── EVENT_MOUSE_MOVE ─────────────────────────────────── */
+            {
+                Event ev;
+                ev.type          = EVENT_MOUSE_MOVE;
+                ev.mouse_x       = mouse_x;
+                ev.mouse_y       = mouse_y;
+                ev.mouse_buttons = mouse_buttons;
+                ev.mouse_pressed = 0;
+                ev.scancode      = 0;
+                ev.ascii         = 0;
+                ev.key_extended  = 0;
+                ev.window_id     = 0;
+                push_event(ev);
+            }
+        }
+
+        /* ── EVENT_MOUSE_CLICK (solo si cambiaron los botones) ───── */
+        if (mouse_buttons != old_buttons) {
+            Event ev;
+            unsigned char changed = mouse_buttons ^ old_buttons;
+            ev.type          = EVENT_MOUSE_CLICK;
+            ev.mouse_x       = mouse_x;
+            ev.mouse_y       = mouse_y;
+            ev.mouse_buttons = mouse_buttons;
+            /* pressed=1 si algún bit pasó de 0→1; 0 si fue 1→0 (release) */
+            ev.mouse_pressed = (mouse_buttons & changed) ? 1 : 0;
+            ev.scancode      = 0;
+            ev.ascii         = 0;
+            ev.key_extended  = 0;
+            ev.window_id     = 0;
+            push_event(ev);
         }
     }
 

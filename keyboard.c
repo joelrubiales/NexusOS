@@ -1,9 +1,15 @@
 /*
  * Driver teclado PS/2 — Scan Code Set 1, US QWERTY básico.
- * IRQ1 ya entra en keyboard_body (idt.c); aquí se traduce a ASCII y cola para getchar.
+ * IRQ1 entra en keyboard_body (idt.c); aquí se traduce a ASCII, se encola
+ * para keyboard_getchar() (CLI) y se empuja un KEY_PRESS al event system (GUI).
+ *
+ * CAMBIO ARQUITECTÓNICO:
+ *   keyboard_irq() ya NO llama a ninguna función de la GUI directamente.
+ *   La lógica de foco, navegación y entrada de texto vive en el bucle de
+ *   mensajes del instalador / escritorio, procesando EVENT_KEY_PRESS.
  */
 #include "keyboard.h"
-#include "gui.h"
+#include "event.h"
 #include "nexus.h"
 
 #define KBD_BUF_SIZE 256
@@ -146,87 +152,55 @@ int keyboard_irq(uint8_t sc, int extended) {
     char base;
     char sh;
 
+    /* Teclas extendidas (0xE0 + sc): ignorar por ahora; flechas, etc. no
+     * necesitan traducción ASCII para el instalador. */
     if (extended)
         return 0;
 
-    /* Break codes (liberación) */
+    /* Break codes (liberación): solo actualizar estado shift, sin evento. */
     if (sc >= 0x80u) {
         if (sc == 0xAAu || sc == 0xB6u)
             kbd_shift = 0;
         return 0;
     }
 
-    /* Shift pulsación */
-    if (sc == 0x2Au || sc == 0x36u) {
-        kbd_shift = 1;
-        return 0;
-    }
+    /* Modificadores puros: actualizar estado interno, sin evento de carácter. */
+    if (sc == 0x2Au || sc == 0x36u) { kbd_shift = 1; return 0; }  /* Shift */
+    if (sc == 0x3Au)                  return 0;                    /* Caps Lock */
+    if (sc == 0x1Du || sc == 0x38u)   return 0;                    /* Ctrl / Alt */
 
-    /* Caps Lock 0x3A — ignorado en mapa básico US */
-    if (sc == 0x3Au)
-        return 0;
-
-    /* Ctrl / Alt izq. make — no encolan carácter */
-    if (sc == 0x1Du || sc == 0x38u)
-        return 0;
-
-    /* ── TEXT_INPUT con foco: capturar toda la entrada de texto ──────────── */
-    if (ui_element_count > 0 &&
-        focused_element_index >= 0 &&
-        focused_element_index < ui_element_count &&
-        ui_elements[focused_element_index].type == UI_TYPE_TEXT_INPUT) {
-
-        /* Backspace */
-        if (sc == 0x0Eu) { ui_handle_char('\b'); return 1; }
-
-        /* TAB / Enter: avanzar foco al siguiente widget */
-        if (sc == 0x0Fu || sc == 0x1Cu) { ui_focus_advance(); return 1; }
-
-        /* ESC: dejar caer (no consumir) para que el bucle exterior lo vea */
-        if (sc == 0x01u) return 0;
-
-        /* Caracteres imprimibles */
-        base = (sc < 128u) ? sc_us_normal[sc] : 0;
-        sh   = (sc < 128u) ? sc_us_shift[sc] : 0;
-        if (kbd_shift) {
-            ch = sh ? sh : base;
-            if (!ch && base >= 'a' && base <= 'z') ch = (char)(base - 32);
-        } else {
-            ch = base;
-        }
-        if (ch >= 32) ui_handle_char((unsigned char)ch);
-        return 1;  /* consumir siempre cuando TEXT_INPUT tiene el foco */
-    }
-
-    /* ── TAB (0x0F) y Enter (0x1C): navegación general en instalador ─────── */
-    if (ui_element_count > 0) {
-        if (sc == 0x0Fu) {
-            ui_focus_advance();
-            ui_redraw();
-            return 1;
-        }
-        if (sc == 0x1Cu) {
-            ui_activate_focused();
-            ui_redraw();
-            return 1;
-        }
-    }
-
+    /* ── Traducir make code → ASCII ──────────────────────────────────── */
     base = (sc < 128u) ? sc_us_normal[sc] : 0;
-    sh   = (sc < 128u) ? sc_us_shift[sc] : 0;
+    sh   = (sc < 128u) ? sc_us_shift[sc]  : 0;
 
     if (kbd_shift) {
         ch = sh ? sh : base;
         if (!ch && base >= 'a' && base <= 'z')
             ch = (char)(base - 32);
-    } else
+    } else {
         ch = base;
+    }
 
-    if (!ch)
-        return 0;
+    /* ── Empujar KEY_PRESS al sistema de eventos (GUI / instalador) ──── */
+    {
+        Event ev;
+        ev.type         = EVENT_KEY_PRESS;
+        ev.scancode     = sc;
+        ev.ascii        = ch;
+        ev.key_extended = 0;
+        ev.mouse_x      = 0;
+        ev.mouse_y      = 0;
+        ev.mouse_buttons= 0;
+        ev.mouse_pressed= 0;
+        ev.window_id    = 0;
+        push_event(ev);
+    }
 
-    kbd_queue_put(ch);
-    return 0;
+    /* ── kbd_buf: cola para keyboard_getchar() usado por el shell CLI ── */
+    if (ch)
+        kbd_queue_put(ch);
+
+    return 0;  /* nunca "consume" desde aquí; la GUI procesa via eventos */
 }
 
 char keyboard_getchar(void) {

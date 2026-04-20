@@ -44,11 +44,15 @@ void keyboard_body(void) {
     unsigned char sc = inb(0x60);
     outb(0x20, 0x20);
 
-    if(sc == 0xE0) { _ext_pending = 1; return; }
-    if(_ext_pending) { _ext_pending = 0; tecla_extended = 1; }
-    else             { tecla_extended = 0; }
-    if (!keyboard_irq(sc, tecla_extended))
-        tecla_nueva = sc;
+    if (sc == 0xE0) { _ext_pending = 1; return; }
+    if (_ext_pending) { _ext_pending = 0; tecla_extended = 1; }
+    else              { tecla_extended = 0; }
+
+    /* Empuja KEY_PRESS al event queue y mantiene kbd_buf (para CLI shell). */
+    keyboard_irq(sc, tecla_extended);
+
+    /* Ruta legacy: gui_run() todavía procesa tecla_nueva con KbdState. */
+    tecla_nueva = sc;
 }
 
 extern void timer_handler(void);

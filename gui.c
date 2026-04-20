@@ -14,6 +14,7 @@
 #include "mouse_gui.h"
 #include "apps.h"
 #include "top_panel.h"
+#include "event.h"
 #include "font_data.h"
 #include <stdint.h>
 
@@ -340,9 +341,8 @@ void gui_run(void) {
     int has_vesa = gfx_vesa_detect(&vbi);
     int running = 1;
     uint64_t last_frame = 0;
-    unsigned char prev_btns = 0;
     int dock_hover;
-    int lx, ly, lw, lh, anchor_x, anchor_y;
+    int lx, ly, lw, lh, anchor_x = 0, anchor_y = 0;
 
     if (has_vesa) {
         if (vbi.bpp == 32u && vbi.pitch > 0u && vbi.height > 0u) {
@@ -444,6 +444,9 @@ void gui_run(void) {
         KbdState kbd;
         kbd_init(&kbd);
 
+    /* Descartar eventos acumulados durante el arranque del escritorio. */
+    flush_events();
+
     while (running) {
         if (ticks - last_frame < 2) {
             __asm__ volatile("hlt");
@@ -451,13 +454,138 @@ void gui_run(void) {
         }
         last_frame = ticks;
 
+        /* ════════════════════════════════════════════════════════════════
+         * BUCLE DE MENSAJES — drena TODOS los eventos antes de renderizar.
+         *
+         * Ratón  : MOUSE_CLICK y MOUSE_MOVE gestionan clic, arrastre y
+         *          liberación sin necesidad de comparar prev_btns.
+         * Teclado: KEY_PRESS se descarta aquí; el teclado se sigue
+         *          procesando por la ruta legacy (tecla_nueva + KbdState)
+         *          porque keyboard_body() sigue asignando tecla_nueva para
+         *          que KbdState reciba todos los scan codes (incluyendo
+         *          shift y break codes que keyboard_irq() no traduce).
+         *          Drenar los KEY_PRESS evita que el ring buffer se llene.
+         * ════════════════════════════════════════════════════════════════ */
+        {
+            Event nev;
+            while (pop_event(&nev)) {
+                switch (nev.type) {
+
+                /* ── Movimiento: arrastrar ventana si hay drag activo ─── */
+                case EVENT_MOUSE_MOVE:
+                    if (nev.mouse_buttons & 1) {
+                        int i;
+                        for (i = 0; i < win_count; i++) {
+                            if (wins[i].dragging) {
+                                nwm_apply_window_drag(&wins[i],
+                                    nev.mouse_x, nev.mouse_y,
+                                    layout_top_h, LAYOUT_WORK_BOTTOM);
+                                break;
+                            }
+                        }
+                    }
+                    break;
+
+                /* ── Clic / soltar ──────────────────────────────────── */
+                case EVENT_MOUSE_CLICK:
+                    if (!nev.mouse_pressed) {
+                        /* Soltar: cancelar arrastres. */
+                        int i;
+                        for (i = 0; i < win_count; i++) wins[i].dragging = 0;
+                        break;
+                    }
+                    if (!(nev.mouse_buttons & 1))
+                        break;  /* solo botón izquierdo */
+
+                    /* Elementos UI del instalador superpuesto. */
+                    if (installer_win.is_visible && ui_element_count > 0) {
+                        int ui_hit = ui_get_element_at(nev.mouse_x, nev.mouse_y);
+                        if (ui_hit >= 0) {
+                            focused_element_index = ui_hit;
+                            ui_activate_focused();
+                            break;
+                        }
+                    }
+
+                    {
+                        int dh = desktop_dock_hit(SW, SH, nev.mouse_x, nev.mouse_y);
+                        if (menu_open) {
+                            if (desktop_menu_contains(anchor_x, anchor_y,
+                                                      nev.mouse_x, nev.mouse_y)) {
+                                int sel = desktop_menu_hit(anchor_x, anchor_y,
+                                                           nev.mouse_x, nev.mouse_y);
+                                if (sel >= 0) {
+                                    menu_open = 0;
+                                    if (sel == MENU_N - 1) { running = 0; break; }
+                                    { int wid = menu_win_id[sel];
+                                      if (wid >= 0 && wid < win_count) win_show(wid); }
+                                }
+                            } else {
+                                menu_open = 0;
+                            }
+                            break;
+                        }
+                        if (dh == -2) { menu_open = !menu_open; menu_sel = 0; break; }
+                        if (dh >= 0 && dh < DOCK_ITEMS) {
+                            if (dh == DOCK_ITEMS - 1) { running = 0; break; }
+                            { int wid = dock_win_id[dh];
+                              if (wid >= 0 && wid < win_count) {
+                                if (wins[wid].visible && wins[wid].focused)
+                                    win_hide(wid);
+                                else
+                                    win_show(wid);
+                              }
+                            }
+                            break;
+                        }
+                        {
+                            int i;
+                            for (i = zcount - 1; i >= 0; i--) {
+                                int id = zorder[i];
+                                if (!wins[id].visible) continue;
+                                if (nev.mouse_x >= wins[id].x &&
+                                    nev.mouse_x <  wins[id].x + wins[id].w &&
+                                    nev.mouse_y >= wins[id].y &&
+                                    nev.mouse_y <  wins[id].y + wins[id].h) {
+                                    if (nwm_hit_close_button(&wins[id],
+                                            nev.mouse_x, nev.mouse_y,
+                                            layout_chrome_title_h)) {
+                                        win_hide(id);
+                                    } else if (nwm_hit_titlebar(&wins[id],
+                                            nev.mouse_x, nev.mouse_y,
+                                            layout_chrome_title_h)) {
+                                        win_show(id);
+                                        wins[id].dragging = 1;
+                                        wins[id].drag_ox = nev.mouse_x - wins[id].x;
+                                        wins[id].drag_oy = nev.mouse_y - wins[id].y;
+                                    } else {
+                                        win_show(id);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    break;
+
+                /* ── KEY_PRESS: drenar para evitar desbordamiento ────── */
+                case EVENT_KEY_PRESS:
+                case EVENT_WINDOW_CLOSE:
+                default:
+                    break;
+                }
+            }
+        }
+
+        if (!running) continue;  /* salida por evento de ratón */
+
+        /* ── Renderizar frame ────────────────────────────────────────── */
         gfx_layout_refresh();
         draw_desktop();
         desktop_draw_top_bar();
         top_panel_draw(SW, SH);
         nwm_paint_painter_order(wins, win_count, zorder, zcount, paint_client_cb, 0);
 
-        /* WM compuesto (p. ej. instalador): encima del contenido NWM, debajo del dock. */
         desktop_paint_wm_windows();
 
         desktop_get_launcher_rect(SW, SH, &lx, &ly, &lw, &lh);
@@ -467,145 +595,40 @@ void gui_run(void) {
         desktop_draw_dock(SW, SH, mouse_x, mouse_y, &dock_hover);
         desktop_draw_app_menu(menu_open, menu_sel, anchor_x, anchor_y);
 
-        /* Cursor encima de todo; volcado rápido al LFB físico. */
         gfx_draw_cursor(mouse_x, mouse_y);
         swap_buffers();
 
-        {
-            unsigned char btns = mouse_buttons;
-            int click = (btns & 1) && !(prev_btns & 1);
-            int held = (btns & 1);
-            int release = !(btns & 1) && (prev_btns & 1);
-            prev_btns = btns;
-
-            if (held && !click) {
-                int i;
-                for (i = 0; i < win_count; i++) {
-                    if (wins[i].dragging) {
-                        nwm_apply_window_drag(&wins[i], mouse_x, mouse_y, layout_top_h, LAYOUT_WORK_BOTTOM);
-                        break;
-                    }
-                }
-            }
-            if (release) {
-                int i;
-                for (i = 0; i < win_count; i++) wins[i].dragging = 0;
-            }
-
-            if (click) {
-                if (installer_win.is_visible && ui_element_count > 0) {
-                    int ui_hit = ui_get_element_at((int)mouse_x, (int)mouse_y);
-                    if (ui_hit >= 0) {
-                        focused_element_index = ui_hit;
-                        ui_activate_focused();
-                        goto done;
-                    }
-                }
-                int dh = desktop_dock_hit(SW, SH, mouse_x, mouse_y);
-                if (menu_open) {
-                    if (desktop_menu_contains(anchor_x, anchor_y, mouse_x, mouse_y)) {
-                        int sel = desktop_menu_hit(anchor_x, anchor_y, mouse_x, mouse_y);
-                        if (sel >= 0) {
-                            menu_open = 0;
-                            if (sel == MENU_N - 1) {
-                                running = 0;
-                                continue;
-                            }
-                            {
-                                int wid = menu_win_id[sel];
-                                if (wid >= 0 && wid < win_count) win_show(wid);
-                            }
-                        }
-                    } else {
-                        menu_open = 0;
-                    }
-                    goto done;
-                }
-
-                if (dh == -2) {
-                    menu_open = !menu_open;
-                    menu_sel = 0;
-                    goto done;
-                }
-                if (dh >= 0 && dh < DOCK_ITEMS) {
-                    if (dh == DOCK_ITEMS - 1) {
-                        running = 0;
-                        continue;
-                    }
-                    {
-                        int wid = dock_win_id[dh];
-                        if (wid >= 0 && wid < win_count) {
-                            if (wins[wid].visible && wins[wid].focused)
-                                win_hide(wid);
-                            else
-                                win_show(wid);
-                        }
-                    }
-                    goto done;
-                }
-
-                {
-                    int i;
-                    for (i = zcount - 1; i >= 0; i--) {
-                        int id = zorder[i];
-                        if (!wins[id].visible) continue;
-                        if (mouse_x >= wins[id].x && mouse_x < wins[id].x + wins[id].w &&
-                            mouse_y >= wins[id].y && mouse_y < wins[id].y + wins[id].h) {
-                            if (nwm_hit_close_button(&wins[id], mouse_x, mouse_y, layout_chrome_title_h))
-                                win_hide(id);
-                            else if (nwm_hit_titlebar(&wins[id], mouse_x, mouse_y, layout_chrome_title_h)) {
-                                win_show(id);
-                                wins[id].dragging = 1;
-                                wins[id].drag_ox = mouse_x - wins[id].x;
-                                wins[id].drag_oy = mouse_y - wins[id].y;
-                            } else
-                                win_show(id);
-                            goto done;
-                        }
-                    }
-                }
-            }
-        }
-    done:
-
+        /* ── Teclado (ruta legacy: tecla_nueva + KbdState) ──────────── */
         if (!tecla_nueva) continue;
         {
             unsigned char sc = tecla_nueva;
-            KbdEvent ev;
+            KbdEvent kev;
             tecla_nueva = 0;
-            ev = kbd_handle_scancode(&kbd, sc);
-            if (ev.type == KBD_EV_NONE) continue;
-            if (ev.type == KBD_EV_ESC) {
-                if (menu_open) {
-                    menu_open = 0;
-                    continue;
-                }
+            kev = kbd_handle_scancode(&kbd, sc);
+            if (kev.type == KBD_EV_NONE) continue;
+            if (kev.type == KBD_EV_ESC) {
+                if (menu_open) { menu_open = 0; continue; }
                 running = 0;
                 continue;
             }
-            if (ev.type == KBD_EV_UP && menu_open) {
+            if (kev.type == KBD_EV_UP && menu_open) {
                 menu_sel = (menu_sel - 1 + MENU_N) % MENU_N;
                 continue;
             }
-            if (ev.type == KBD_EV_DOWN && menu_open) {
+            if (kev.type == KBD_EV_DOWN && menu_open) {
                 menu_sel = (menu_sel + 1) % MENU_N;
                 continue;
             }
-            if (ev.type == KBD_EV_ENTER && menu_open) {
+            if (kev.type == KBD_EV_ENTER && menu_open) {
                 menu_open = 0;
-                if (menu_sel == MENU_N - 1) {
-                    running = 0;
-                    continue;
-                }
-                {
-                    int wid = menu_win_id[menu_sel];
-                    if (wid >= 0 && wid < win_count) win_show(wid);
-                }
+                if (menu_sel == MENU_N - 1) { running = 0; continue; }
+                { int wid = menu_win_id[menu_sel];
+                  if (wid >= 0 && wid < win_count) win_show(wid); }
                 continue;
             }
-            if (ev.type == KBD_EV_CHAR) {
-                if (ev.ch >= '1' && ev.ch <= '5') {
-                    int id = ev.ch - '1';
+            if (kev.type == KBD_EV_CHAR) {
+                if (kev.ch >= '1' && kev.ch <= '5') {
+                    int id = kev.ch - '1';
                     if (id < win_count) {
                         if (wins[id].visible && wins[id].focused)
                             win_hide(id);
@@ -614,27 +637,21 @@ void gui_run(void) {
                     }
                     continue;
                 }
-                if (ev.ch == '\t') {
-                    if (ui_element_count > 0) {
-                        ui_focus_advance();
-                        continue;
-                    }
+                if (kev.ch == '\t') {
+                    if (ui_element_count > 0) { ui_focus_advance(); continue; }
                     int n = (focus_id + 1) % win_count;
                     int t;
                     for (t = 0; t < win_count; t++) {
-                        if (wins[n].visible) {
-                            win_show(n);
-                            break;
-                        }
+                        if (wins[n].visible) { win_show(n); break; }
                         n = (n + 1) % win_count;
                     }
                     continue;
                 }
-                if ((ev.ch == 'w' || ev.ch == 'W') && focus_id >= 0) {
+                if ((kev.ch == 'w' || kev.ch == 'W') && focus_id >= 0) {
                     win_hide(focus_id);
                     continue;
                 }
-                if ((ev.ch == 'n' || ev.ch == 'N') && focus_id < 0) {
+                if ((kev.ch == 'n' || kev.ch == 'N') && focus_id < 0) {
                     menu_open = !menu_open;
                     menu_sel = 0;
                     continue;
