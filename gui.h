@@ -2,7 +2,9 @@
 #define GUI_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "gfx.h"
+#include "bmp_loader.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Widget system — tipos, estructura y API pública.
@@ -94,6 +96,20 @@ int  gui_framebuffer_init_kmalloc(const VesaBootInfo* vbi);
 
 void gui_put_pixel(int x, int y, uint32_t rgb);
 void gui_draw_rect(int x, int y, int w, int h, uint32_t rgb);
+
+/* Blit ARGB → doble búfer GUI: alpha 0 = transparente; otro = mezcla. */
+void gui_draw_image(int x, int y, const Image* img);
+void gui_draw_image_rect(int x, int y, int src_x, int src_y, int src_w, int src_h, const Image* img);
+/* Escalado nearest-neighbor a rectángulo destino (p. ej. fondo / ventana). */
+void gui_draw_image_stretch(int x, int y, int dst_w, int dst_h, const Image* img);
+
+/*
+ * Instalador / UI: solo repintar y swap cuando hay cambios (o animación activa).
+ * Marcar tras entrada, hover, cambio de paso, etc.
+ */
+extern volatile bool ui_needs_update;
+void ui_mark_dirty(void);
+
 void swap_buffers(void);
 
 /*

@@ -99,6 +99,14 @@ void ui_manager_update_hover(int mouse_x, int mouse_y) {
         g_nodes[i].is_hovered = (i == hit) ? 1 : 0;
 }
 
+int ui_manager_hover_element_index(void) {
+    return g_hover_element_index;
+}
+
+int ui_manager_element_is_hovered(int element_index) {
+    return element_index >= 0 && element_index == g_hover_element_index;
+}
+
 int ui_manager_handle_primary_click(int mouse_x, int mouse_y) {
     int hi;
 

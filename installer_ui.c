@@ -16,6 +16,21 @@
 #include "vfs.h"
 #include <stddef.h>
 
+Image* installer_bg_image;
+Image* installer_window_bg;
+Image* installer_btn_hover;
+
+void installer_paint_background_fullscreen(void) {
+    int sw = gfx_width();
+    int sh = gfx_height();
+    if (sw < 1 || sh < 1)
+        return;
+    if (installer_bg_image && installer_bg_image->pixels)
+        gui_draw_image_stretch(0, 0, sw, sh, installer_bg_image);
+    else
+        gfx_fill_screen_solid((unsigned int)(COLOR_DESKTOP_BG & 0xFFFFFFu));
+}
+
 /* Ancho de la barra lateral en píxeles lógicos. */
 #define SIDEBAR_W_MIN  100
 #define SIDEBAR_W_MAX  200
@@ -244,22 +259,24 @@ static void installer_draw_floating_shell(const Window* w) {
     if (ww < 120 || hh < 80)
         return;
 
-    /* Tinte sombra: gris muy oscuro (no negro puro). */
-    draw_drop_shadow(x, y, ww, hh, R, INSTALLER_SHADOW_SPREAD, 0xFF2C2C2Eu);
-    draw_rounded_rect_filled(x, y, ww, hh, R, COLOR_BG_WINDOW);
+    if (installer_window_bg && installer_window_bg->pixels) {
+        gui_draw_image_stretch(x, y, ww, hh, installer_window_bg);
+    } else {
+        draw_drop_shadow(x, y, ww, hh, R, INSTALLER_SHADOW_SPREAD, 0xFF2C2C2Eu);
+        draw_rounded_rect_filled(x, y, ww, hh, R, COLOR_BG_WINDOW);
 
-    /* Velo “mica” sobre el cuerpo (debajo del título), CPU puro. */
-    if (hh > INSTALLER_WIN_TITLE_H + 16) {
-        int mx = x + 2;
-        int my = y + INSTALLER_WIN_TITLE_H - 2;
-        int mw = ww - 4;
-        int mh = hh - INSTALLER_WIN_TITLE_H;
-        int mr = R > 6 ? R - 4 : 4;
-        if (mr > mw / 2)
-            mr = mw / 2;
-        if (mr > mh / 2)
-            mr = mh / 2;
-        gfx_rect_mica(mx, my, mw, mh, mr, 0xFFFFFFu, 38u);
+        if (hh > INSTALLER_WIN_TITLE_H + 16) {
+            int mx = x + 2;
+            int my = y + INSTALLER_WIN_TITLE_H - 2;
+            int mw = ww - 4;
+            int mh = hh - INSTALLER_WIN_TITLE_H;
+            int mr = R > 6 ? R - 4 : 4;
+            if (mr > mw / 2)
+                mr = mw / 2;
+            if (mr > mh / 2)
+                mr = mh / 2;
+            gfx_rect_mica(mx, my, mw, mh, mr, 0xFFFFFFu, 38u);
+        }
     }
 
     t = w->title ? w->title : "Instalador";
@@ -275,35 +292,29 @@ static void installer_draw_floating_shell(const Window* w) {
 }
 
 /*
- * btn_style: 0 = secundario (neutro), 1 = primario (accent), 2 = destructivo (rojo apagado).
+ * Hitbox invisible: solo etiqueta + imagen hover (asset BMP). btn_style afecta al color del texto.
+ * elem_idx: índice en ui_elements[]; si < 0 no hay hit-test de hover.
  */
-static void draw_labeled_button(int x, int y, int bw, int bh,
-                                const char* label, int btn_style, int focused) {
+static void draw_installer_button(int x, int y, int bw, int bh, const char* label, int btn_style,
+                                  int elem_idx) {
     int          tw = gfx_aa_text_w(label, 1);
     int          tx = x + (bw - tw) / 2;
     int          ty = y + (bh - FONT_AA_GLYPH_H) / 2;
     unsigned int fg;
-    uint32_t     fill;
 
-    (void)BTN_PAD_MIN_H;
     if (bh < FONT_AA_GLYPH_H + 2 * BTN_PAD_MIN_V)
         ty = y + (bh - FONT_AA_GLYPH_H) / 2;
 
-    (void)focused; /* anillo de foco: ui_manager_draw_focus_rings() */
+    if (elem_idx >= 0 && ui_manager_element_is_hovered(elem_idx) && installer_btn_hover
+        && installer_btn_hover->pixels)
+        gui_draw_image_stretch(x, y, bw, bh, installer_btn_hover);
 
-    if (btn_style == 2) {
-        fill = ARGB(255, 186, 72, 68);
-        fg   = RGB(255, 252, 252);
-    } else if (btn_style == 1) {
-        fill = OPAQUE_ARGB(COLOR_ACCENT);
-        fg   = RGB(255, 255, 255);
-    } else {
-        fill = ARGB(255, 252, 252, 254);
-        fg   = INS_RGB(COLOR_TEXT_PRIMARY);
-    }
-    gfx_fill_rounded_rect_aa(x, y, bw, bh, BTN_CORNER_R, fill);
-    if (btn_style == 0)
-        gfx_blend_rect(x + 2, y + bh - 2, bw - 4, 1, INS_RGB(COLOR_BORDER), 45);
+    if (btn_style == 2)
+        fg = RGB(255, 252, 252);
+    else if (btn_style == 1)
+        fg = RGB(255, 255, 255);
+    else
+        fg = INS_RGB(COLOR_TEXT_PRIMARY);
 
     gfx_aa_text(tx, ty, label, fg, 1);
 }
@@ -374,8 +385,9 @@ static void draw_welcome(int cx, int cy, int cw, int ch) {
         int bx = cx + cw - bw - 24;
         int by = cy + ch - bh - 20;
         int fi = ui_push_button(1, bx, by, bw, bh, cb_welcome_next);
-        draw_labeled_button(bx, by, bw, bh, "Continuar", 1,
-                            fi >= 0 && focused_element_index == fi);
+        ui_manager_sync_from_elements();
+        ui_manager_update_hover((int)mouse_get_x(), (int)mouse_get_y());
+        draw_installer_button(bx, by, bw, bh, "Continuar", 1, fi);
     }
 }
 
@@ -384,7 +396,6 @@ static void draw_welcome(int cx, int cy, int cw, int ch) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void draw_locale_step(int cx, int cy, int cw, int ch) {
     int mx, my, mw, mh;
-    int fi;
 
     gfx_aa_text(cx + 20, cy + 16, "Region y zona horaria",
                 INS_RGB(COLOR_TEXT_PRIMARY), 2);
@@ -447,9 +458,10 @@ static void draw_locale_step(int cx, int cy, int cw, int ch) {
         int bw = 168, bh = 44;
         int bx = cx + cw - bw - 24;
         int by = cy + ch - bh - 20;
-        fi = ui_push_button(100, bx, by, bw, bh, cb_locale_next);
-        draw_labeled_button(bx, by, bw, bh, "Continuar", 1,
-                            fi >= 0 && focused_element_index == fi);
+        int fi = ui_push_button(100, bx, by, bw, bh, cb_locale_next);
+        ui_manager_sync_from_elements();
+        ui_manager_update_hover((int)mouse_get_x(), (int)mouse_get_y());
+        draw_installer_button(bx, by, bw, bh, "Continuar", 1, fi);
     }
 }
 
@@ -461,7 +473,7 @@ static void draw_user_account_step(int cx, int cy, int cw, int ch) {
     int field_h  = 44;
     int field_x  = cx + 20;
     int label_y, field_y;
-    int fi, idx;
+    int idx;
 
     gfx_aa_text(cx + 20, cy + 16, "Cree su cuenta",
                 INS_RGB(COLOR_TEXT_PRIMARY), 2);
@@ -500,20 +512,17 @@ static void draw_user_account_step(int cx, int cy, int cw, int ch) {
     if (ins_password[0]) restore_text_input(idx, ins_password);
 
     {
-        int bw = 132, bh = 44;
-        int bx = cx + 24;
-        int by = cy + ch - bh - 20;
-        fi = ui_push_button(204, bx, by, bw, bh, cb_user_back);
-        draw_labeled_button(bx, by, bw, bh, "Atras", 0,
-                            fi >= 0 && focused_element_index == fi);
-    }
-    {
-        int bw = 168, bh = 44;
-        int bx = cx + cw - bw - 24;
-        int by = cy + ch - bh - 20;
-        fi = ui_push_button(205, bx, by, bw, bh, cb_user_next);
-        draw_labeled_button(bx, by, bw, bh, "Continuar", 1,
-                            fi >= 0 && focused_element_index == fi);
+        int bw0 = 132, bh0 = 44;
+        int bx0 = cx + 24;
+        int by0 = cy + ch - bh0 - 20;
+        int bw1 = 168, bh1 = 44;
+        int bx1 = cx + cw - bw1 - 24;
+        int fi_b = ui_push_button(204, bx0, by0, bw0, bh0, cb_user_back);
+        int fi_n = ui_push_button(205, bx1, by0, bw1, bh1, cb_user_next);
+        ui_manager_sync_from_elements();
+        ui_manager_update_hover((int)mouse_get_x(), (int)mouse_get_y());
+        draw_installer_button(bx0, by0, bw0, bh0, "Atras", 0, fi_b);
+        draw_installer_button(bx1, by0, bw1, bh1, "Continuar", 1, fi_n);
     }
 }
 
@@ -588,20 +597,17 @@ static void draw_disk_setup(int cx, int cy, int cw, int ch) {
     }
 
     {
-        int bw = 132, bh = 44;
-        int bx = cx + 24;
-        int by = cy + ch - bh - 20;
-        fi = ui_push_button(32, bx, by, bw, bh, cb_disk_back);
-        draw_labeled_button(bx, by, bw, bh, "Atras", 0,
-                            fi >= 0 && focused_element_index == fi);
-    }
-    {
-        int bw = 168, bh = 44;
-        int bx = cx + cw - bw - 24;
-        int by = cy + ch - bh - 20;
-        fi = ui_push_button(33, bx, by, bw, bh, cb_disk_next);
-        draw_labeled_button(bx, by, bw, bh, "Continuar", 1,
-                            fi >= 0 && focused_element_index == fi);
+        int bw0 = 132, bh0 = 44;
+        int bx0 = cx + 24;
+        int by0 = cy + ch - bh0 - 20;
+        int bw1 = 168, bh1 = 44;
+        int bx1 = cx + cw - bw1 - 24;
+        int fi0 = ui_push_button(32, bx0, by0, bw0, bh0, cb_disk_back);
+        int fi1 = ui_push_button(33, bx1, by0, bw1, bh1, cb_disk_next);
+        ui_manager_sync_from_elements();
+        ui_manager_update_hover((int)mouse_get_x(), (int)mouse_get_y());
+        draw_installer_button(bx0, by0, bw0, bh0, "Atras", 0, fi0);
+        draw_installer_button(bx1, by0, bw1, bh1, "Continuar", 1, fi1);
     }
 }
 
@@ -612,7 +618,6 @@ static void draw_summary_step(int cx, int cy, int cw, int ch) {
     int lx = cx + 32;
     int rx = cx + cw / 2 + 8;
     int y;
-    int fi;
     char line[96];
     int p;
     const char* a;
@@ -657,26 +662,22 @@ static void draw_summary_step(int cx, int cy, int cw, int ch) {
         return;
 
     {
-        int bw = 120, bh = 42;
-        int bx = cx + 24;
-        int by = cy + ch - bh - 20;
-        fi = ui_push_button(40, bx, by, bw, bh, cb_summary_back);
-        draw_labeled_button(bx, by, bw, bh, "Atras", 0,
-                            fi >= 0 && focused_element_index == fi);
-    }
-    {
-        int bw = 196, bh = 44;
-        int bx = cx + cw - bw - 24;
-        int by = cy + ch - bh - 20;
-        fi = ui_push_button(41, bx, by, bw, bh, cb_summary_install);
-        draw_labeled_button(bx, by, bw, bh, "Instalar ahora", 1,
-                            fi >= 0 && focused_element_index == fi);
+        int bw0 = 120, bh0 = 42;
+        int bx0 = cx + 24;
+        int by0 = cy + ch - bh0 - 20;
+        int bw1 = 196, bh1 = 44;
+        int bx1 = cx + cw - bw1 - 24;
+        int fi0 = ui_push_button(40, bx0, by0, bw0, bh0, cb_summary_back);
+        int fi1 = ui_push_button(41, bx1, by0, bw1, bh1, cb_summary_install);
+        ui_manager_sync_from_elements();
+        ui_manager_update_hover((int)mouse_get_x(), (int)mouse_get_y());
+        draw_installer_button(bx0, by0, bw0, bh0, "Atras", 0, fi0);
+        draw_installer_button(bx1, by0, bw1, bh1, "Instalar ahora", 1, fi1);
     }
 }
 
 static void draw_destructive_modal(int cx, int cy, int cw, int ch) {
     int mx, my, mw, mh;
-    int fi;
 
     gfx_blend_rect(cx, cy, cw, ch, RGB(10, 10, 18), 140);
 
@@ -712,20 +713,17 @@ static void draw_destructive_modal(int cx, int cy, int cw, int ch) {
                 RGB(235, 210, 210), 1);
 
     {
-        int bw = 132, bh = 42;
-        int bx = mx + 24;
-        int by = my + mh - bh - 20;
-        fi = ui_push_button(300, bx, by, bw, bh, cb_warn_cancel);
-        draw_labeled_button(bx, by, bw, bh, "Cancelar", 0,
-                            fi >= 0 && focused_element_index == fi);
-    }
-    {
-        int bw = 148, bh = 42;
-        int bx = mx + mw - bw - 24;
-        int by = my + mh - bh - 20;
-        fi = ui_push_button(301, bx, by, bw, bh, cb_warn_confirm);
-        draw_labeled_button(bx, by, bw, bh, "Borrar disco", 2,
-                            fi >= 0 && focused_element_index == fi);
+        int bw0 = 132, bh0 = 42;
+        int bx0 = mx + 24;
+        int by0 = my + mh - bh0 - 20;
+        int bw1 = 148, bh1 = 42;
+        int bx1 = mx + mw - bw1 - 24;
+        int fi0 = ui_push_button(300, bx0, by0, bw0, bh0, cb_warn_cancel);
+        int fi1 = ui_push_button(301, bx1, by0, bw1, bh1, cb_warn_confirm);
+        ui_manager_sync_from_elements();
+        ui_manager_update_hover((int)mouse_get_x(), (int)mouse_get_y());
+        draw_installer_button(bx0, by0, bw0, bh0, "Cancelar", 0, fi0);
+        draw_installer_button(bx1, by0, bw1, bh1, "Borrar disco", 2, fi1);
     }
 }
 
@@ -764,6 +762,7 @@ static void draw_installing(int cx, int cy, int cw, int ch) {
             current_step    = FINISHED;
             extr_init_done  = 0;
             install_timer_armed = 0;
+            ui_mark_dirty();
             return;
         }
     } else {
@@ -774,6 +773,7 @@ static void draw_installing(int cx, int cy, int cw, int ch) {
         if (extr_pct >= 100) {
             current_step        = FINISHED;
             install_timer_armed = 0;
+            ui_mark_dirty();
             return;
         }
     }
@@ -875,20 +875,17 @@ static void draw_finished(int cx, int cy, int cw, int ch) {
     gfx_aa_text(cx + (cw - tw)/2, y, l3, SIDEBAR_MUTED, 1);
 
     {
-        int bw = 168, bh = 44;
-        int bx = cx + cw - 2 * bw - 32;
-        int by = cy + ch - bh - 20;
-        int fi = ui_push_button(5, bx, by, bw, bh, cb_view_log);
-        draw_labeled_button(bx, by, bw, bh, "Ver registro", 0,
-                            fi >= 0 && focused_element_index == fi);
-    }
-    {
-        int bw = 188, bh = 44;
-        int bx = cx + cw - bw - 24;
-        int by = cy + ch - bh - 20;
-        int fi = ui_push_button(4, bx, by, bw, bh, cb_reboot);
-        draw_labeled_button(bx, by, bw, bh, "Reiniciar ahora", 1,
-                            fi >= 0 && focused_element_index == fi);
+        int bw0 = 168, bh0 = 44;
+        int bx0 = cx + cw - 2 * bw0 - 32;
+        int by0 = cy + ch - bh0 - 20;
+        int bw1 = 188, bh1 = 44;
+        int bx1 = cx + cw - bw1 - 24;
+        int fi0 = ui_push_button(5, bx0, by0, bw0, bh0, cb_view_log);
+        int fi1 = ui_push_button(4, bx1, by0, bw1, bh1, cb_reboot);
+        ui_manager_sync_from_elements();
+        ui_manager_update_hover((int)mouse_get_x(), (int)mouse_get_y());
+        draw_installer_button(bx0, by0, bw0, bh0, "Ver registro", 0, fi0);
+        draw_installer_button(bx1, by0, bw1, bh1, "Reiniciar ahora", 1, fi1);
     }
 }
 

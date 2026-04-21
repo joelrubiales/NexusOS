@@ -1,10 +1,8 @@
 /*
  * Instalador gráfico de arranque: inicialización del escritorio y asistente (installer_ui).
  *
- * ARQUITECTURA DE EVENTOS:
- *   start_gui_installer() ya no sondea mouse_buttons ni tecla_nueva directamente.
- *   En cada frame consume todos los Event* del ring buffer y despacha la
- *   lógica interactiva exclusivamente dentro del switch(ev.type).
+ * Pipeline visual: fondo/ventana/botones vía BMP (installer_ui); repintado solo si
+ * ui_needs_update o animación del paso INSTALLING.
  */
 #include "gui_installer.h"
 #include "gui.h"
@@ -17,7 +15,6 @@
 #include "window.h"
 #include "event.h"
 #include "ui_manager.h"
-#include "gfx.h"
 #include <stdint.h>
 
 extern volatile uint64_t ticks;
@@ -46,16 +43,16 @@ static void installer_paint_frame(void) {
     if (wy < 8)
         wy = 8;
 
-    win.x         = wx;
-    win.y         = wy;
-    win.width     = ww;
-    win.height    = wh;
-    win.title     = "Instalador de NexusOS";
+    win.x          = wx;
+    win.y          = wy;
+    win.width      = ww;
+    win.height     = wh;
+    win.title      = "Instalador de NexusOS";
     win.is_visible = 1;
     win.is_active  = 1;
     win.z_index    = 100;
 
-    gfx_fill_screen_solid((unsigned int)(COLOR_DESKTOP_BG & 0xFFFFFFu));
+    installer_paint_background_fullscreen();
     draw_installer_content(&win);
 }
 
@@ -86,7 +83,10 @@ void init_desktop(void) {
 
 static void installer_process_events(void) {
     Event ev;
+    int   any = 0;
+
     while (pop_event(&ev)) {
+        any = 1;
         switch (ev.type) {
         case EVENT_MOUSE_MOVE:
             if (ui_element_count > 0)
@@ -100,23 +100,22 @@ static void installer_process_events(void) {
             if (ui_element_count <= 0)
                 break;
 
-            /* Flechas (Set 1 extendido): navegar el anillo de foco. */
             if (ev.key_extended) {
-                if (ev.scancode == 0x50u || ev.scancode == 0x4Du) /* Down, Right */
+                if (ev.scancode == 0x50u || ev.scancode == 0x4Du)
                     ui_focus_tab_next();
-                else if (ev.scancode == 0x48u || ev.scancode == 0x4Bu) /* Up, Left */
+                else if (ev.scancode == 0x48u || ev.scancode == 0x4Bu)
                     ui_focus_tab_prev();
                 ui_manager_sync_focus_flags();
                 break;
             }
 
-            if (ev.scancode == 0x0Fu) { /* Tab */
+            if (ev.scancode == 0x0Fu) {
                 ui_focus_tab_next();
                 ui_manager_sync_focus_flags();
                 break;
             }
 
-            if (ev.scancode == 0x1Cu) { /* Enter → activar widget enfocado */
+            if (ev.scancode == 0x1Cu) {
                 ui_activate_focused();
                 break;
             }
@@ -142,17 +141,15 @@ static void installer_process_events(void) {
             break;
         }
     }
+    if (any)
+        ui_mark_dirty();
 }
 
 void installer_desktop_step(void) {
-    /*
-     * 1) Pintar → registra widgets + anillo de foco (Tab coherente con el paso).
-     * 2) Eventos → teclado/ratón actualizan buffers y foco.
-     * 3) Pintar de nuevo → refleja texto/foco en el mismo frame.
-     */
-    installer_paint_frame();
+    /* API syscall / userland: un frame completo siempre. */
     installer_process_events();
     installer_paint_frame();
+    ui_needs_update = false;
     gfx_layout_refresh();
     gfx_draw_cursor((int)mouse_get_x(), (int)mouse_get_y());
     gfx_mark_present_full();
@@ -160,16 +157,34 @@ void installer_desktop_step(void) {
 }
 
 void start_gui_installer(void) {
-    uint64_t last_frame = 0;
+    uint64_t last_anim_tick = 0;
 
     flush_events();
+    ui_mark_dirty();
 
     for (;;) {
-        if (ticks - last_frame < 2) {
-            __asm__ volatile("hlt");
-            continue;
+        installer_process_events();
+
+        {
+            int need = ui_needs_update ? 1 : 0;
+            if (current_step == INSTALLING) {
+                if (ticks - last_anim_tick >= 2) {
+                    need            = 1;
+                    last_anim_tick  = ticks;
+                }
+            }
+            if (!need) {
+                __asm__ volatile("hlt");
+                continue;
+            }
         }
-        last_frame = ticks;
-        installer_desktop_step();
+
+        ui_needs_update = false;
+        installer_paint_frame();
+
+        gfx_layout_refresh();
+        gfx_draw_cursor((int)mouse_get_x(), (int)mouse_get_y());
+        gfx_mark_present_full();
+        swap_buffers();
     }
 }

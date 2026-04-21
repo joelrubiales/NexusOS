@@ -2,6 +2,15 @@
 #define NEXUS_INSTALLER_UI_H
 
 #include "window.h"
+#include "bmp_loader.h"
+
+/* Assets BMP (NULL = fallback primitivo). Asignar tras load_bmp desde initrd/VFS. */
+extern Image* installer_bg_image;
+extern Image* installer_window_bg;
+extern Image* installer_btn_hover;
+
+/* Fondo a pantalla completa (escalado) sobre el backbuffer GUI. */
+void installer_paint_background_fullscreen(void);
 
 /* Debe coincidir con WM_TITLE_H / WM_CLIENT_INSET en window.c */
 #define INSTALLER_WIN_TITLE_H   52

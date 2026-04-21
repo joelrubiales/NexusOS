@@ -41,7 +41,7 @@ CFLAGS := -m64 \
 LIBGCC   := $(shell $(CC) $(CFLAGS) -print-libgcc-file-name)
 LDFLAGS  := -m elf_x86_64 -T linker.ld -nostdlib -static
 
-COBJS := kernel.o idt.o pit.o keyboard.o pantalla.o teclado.o pci.o hda.o xhci.o nic.o e1000.o net.o vga.o gfx.o compositor.o gui.o font8x8.o \
+COBJS := kernel.o idt.o pit.o keyboard.o pantalla.o teclado.o pci.o hda.o xhci.o nic.o e1000.o net.o vga.o gfx.o compositor.o bmp_loader.o gui.o font8x8.o \
 	syscalls.o nexus_userland.o ext2.o shm.o ipc.o \
 	mouse.o memory.o paging.o kmalloc.o disk.o multitasking.o scheduler.o shell.o gui_installer.o vesa.o window.o desktop.o installer_ui.o mouse_gui.o \
 	apps.o top_panel.o dock_icons.o icons_data.o vfs.o tar.o event_queue.o event_system.o ui_manager.o font_aa.o elf_loader.o smp.o

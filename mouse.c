@@ -1,7 +1,8 @@
 /*
- * Ratón PS/2 (8042 aux, IRQ12) — modo “siempre que sea posible”.
+ * Ratón PS/2 (8042 aux, IRQ12).
  *
- * Estado encapsulado (sin variables globales públicas): usar mouse_get_*().
+ * Inicialización agresiva del 8042 + máquina de estados con resincronización
+ * (bit 0x08 en el primer byte). Estado: mouse_get_*().
  */
 #include "mouse.h"
 #include "event_queue.h"
@@ -32,12 +33,28 @@ static int     mouse_packet_len   = 3;
 #define PS2_STATUS 0x64
 #define PS2_CMD    0x64
 
-#define ST_OUT_FULL 0x01
-#define ST_IN_FULL  0x02
+/* Puerto 0x64: bit0 salida lista (leer 0x60); bit1 entrada llena (no escribir). */
+#define ST_OUT_FULL 0x01u
+#define ST_IN_FULL  0x02u
+
+#define PS2_CMD_DISABLE_KBD 0xADu
+#define PS2_CMD_DISABLE_AUX 0xA7u
+#define PS2_CMD_ENABLE_AUX  0xA8u
+#define PS2_CMD_ENABLE_KBD  0xAEu
+#define PS2_CMD_WRITE_AUX   0xD4u
+#define PS2_CMD_READ_CB     0x20u
+#define PS2_CMD_WRITE_CB    0x60u
+
+#define PS2_MOUSE_ACK   0xFAu
+#define PS2_MOUSE_RESEND 0xFEu
 
 #define PIC_MASTER_CMD 0x20u
 #define PIC_SLAVE_CMD  0xA0u
 #define PIC_EOI        0x20u
+
+#define PS2_SPIN_MAX_READ  500000u
+#define PS2_SPIN_MAX_WRITE 256000u
+#define PS2_DRAIN_MAX_OPS  65536u
 
 int32_t mouse_get_x(void) {
     return g_mouse.pos_x;
@@ -51,22 +68,29 @@ uint8_t mouse_get_buttons(void) {
     return g_mouse.buttons;
 }
 
-static void ps2_flush_out(void) {
-    while (inb(PS2_STATUS) & ST_OUT_FULL)
+static void ps2_drain_output(void) {
+    uint32_t n = 0;
+    while ((inb(PS2_STATUS) & ST_OUT_FULL) && n < PS2_DRAIN_MAX_OPS) {
         (void)inb(PS2_DATA);
+        n++;
+    }
 }
 
-static void ps2_wait_write(void) {
+/*
+ * Espera a que el buffer de entrada del controlador esté vacío (bit1 == 0)
+ * antes de escribir en 0x64 / 0x60.
+ */
+static void ps2_wait_input_empty(void) {
     uint32_t i;
-    for (i = 0; i < 100000u; i++) {
+    for (i = 0; i < PS2_SPIN_MAX_WRITE; i++) {
         if (!(inb(PS2_STATUS) & ST_IN_FULL))
             return;
     }
 }
 
-static int ps2_wait_read(void) {
+static int ps2_wait_output_ready(void) {
     uint32_t i;
-    for (i = 0; i < 500000u; i++) {
+    for (i = 0; i < PS2_SPIN_MAX_READ; i++) {
         if (inb(PS2_STATUS) & ST_OUT_FULL)
             return 0;
     }
@@ -78,20 +102,45 @@ static void mouse_send_pic_eoi_both(void) {
     outb(PIC_MASTER_CMD, PIC_EOI);
 }
 
+static void ps2_controller_cmd(uint8_t cmd) {
+    ps2_wait_input_empty();
+    outb(PS2_CMD, cmd);
+}
+
+/*
+ * Reinicio agresivo: vaciar salida, desactivar ambos puertos, vaciar de nuevo,
+ * activar solo el auxiliar (el teclado se rehabilita al final de mouse_init).
+ */
+static void ps2_aggressive_aux_prep(void) {
+    ps2_drain_output();
+
+    ps2_controller_cmd(PS2_CMD_DISABLE_KBD);
+    ps2_drain_output();
+
+    ps2_controller_cmd(PS2_CMD_DISABLE_AUX);
+    ps2_drain_output();
+
+    ps2_controller_cmd(PS2_CMD_ENABLE_AUX);
+    ps2_drain_output();
+}
+
+/* Escribe un byte al ratón (puerto aux); espera ACK 0xFA o reintenta RESEND. */
 static int mouse_dev_write(unsigned char cmd) {
     int attempt;
-    for (attempt = 0; attempt < 5; attempt++) {
-        ps2_wait_write();
-        outb(PS2_CMD, 0xD4);
-        ps2_wait_write();
+    for (attempt = 0; attempt < 8; attempt++) {
+        ps2_wait_input_empty();
+        outb(PS2_CMD, PS2_CMD_WRITE_AUX);
+        ps2_wait_input_empty();
         outb(PS2_DATA, cmd);
-        if (ps2_wait_read() != 0)
+        if (ps2_wait_output_ready() != 0)
             continue;
-        unsigned char ack = inb(PS2_DATA);
-        if (ack == 0xFA)
-            return 0;
-        if (ack != 0xFE)
-            return -1;
+        {
+            unsigned char ack = inb(PS2_DATA);
+            if (ack == PS2_MOUSE_ACK)
+                return 0;
+            if (ack != PS2_MOUSE_RESEND)
+                return -1;
+        }
     }
     return -1;
 }
@@ -99,7 +148,7 @@ static int mouse_dev_write(unsigned char cmd) {
 static int mouse_read_data_byte(unsigned char* out) {
     if (!out)
         return -1;
-    if (ps2_wait_read() != 0)
+    if (ps2_wait_output_ready() != 0)
         return -1;
     *out = inb(PS2_DATA);
     return 0;
@@ -125,19 +174,19 @@ static void mouse_probe_intellimouse(void) {
     (void)mouse_dev_write(0xF3);
     (void)mouse_dev_write(80u);
 
-    ps2_flush_out();
+    ps2_drain_output();
 
     if (mouse_get_device_id(&id) == 0 && (id == 3u || id == 4u))
         mouse_packet_len = 4;
 }
 
 static int mouse_init_plain_streaming(void) {
-    ps2_flush_out();
+    ps2_drain_output();
     (void)mouse_dev_write(0xF5);
-    ps2_flush_out();
-    (void)mouse_dev_write(0xF6);
-    ps2_flush_out();
-    ps2_flush_out();
+    ps2_drain_output();
+    if (mouse_dev_write(0xF6) != 0)
+        return -1;
+    ps2_drain_output();
     mouse_packet_len = 3;
     return mouse_dev_write(0xF4);
 }
@@ -181,25 +230,25 @@ static void mouse_enqueue_ps2_packet(int use_scroll_byte) {
     event_queue_push(&o);
 }
 
-static void mouse_ps2_controller_enable_irq(void) {
-    ps2_flush_out();
+/*
+ * IRQ12 habilitado en el byte de configuración del 8042: bit1, y reloj ratón activo (~bit5).
+ */
+static void mouse_ps2_program_command_byte_irq(void) {
+    ps2_drain_output();
 
-    ps2_wait_write();
-    outb(PS2_CMD, 0xA8);
-
-    ps2_wait_write();
-    outb(PS2_CMD, 0x20);
-    if (ps2_wait_read() == 0) {
+    ps2_controller_cmd(PS2_CMD_READ_CB);
+    if (ps2_wait_output_ready() != 0)
+        return;
+    {
         unsigned char cb = inb(PS2_DATA);
-        cb |= 0x02;
-        cb &= (unsigned char)~0x20;
-        ps2_wait_write();
-        outb(PS2_CMD, 0x60);
-        ps2_wait_write();
+        cb |= 0x02u;
+        cb &= (unsigned char)~0x20u;
+        ps2_wait_input_empty();
+        outb(PS2_CMD, PS2_CMD_WRITE_CB);
+        ps2_wait_input_empty();
         outb(PS2_DATA, cb);
     }
-
-    ps2_flush_out();
+    ps2_drain_output();
 }
 
 NexusStatus mouse_init(int32_t sw, int32_t sh) {
@@ -221,20 +270,28 @@ NexusStatus mouse_init(int32_t sw, int32_t sh) {
 
     __asm__ volatile("cli");
 
-    mouse_ps2_controller_enable_irq();
+    ps2_aggressive_aux_prep();
 
-    (void)mouse_dev_write(0xF6);
-    ps2_flush_out();
-    ps2_flush_out();
+    /* Valores por defecto (F6) y ACK; luego sondeo rueda; streaming (F4) y ACK. */
+    if (mouse_dev_write(0xF6) != 0) {
+        ps2_drain_output();
+        (void)mouse_dev_write(0xF6);
+    }
+    ps2_drain_output();
 
     mouse_probe_intellimouse();
 
-    ps2_flush_out();
-    ps2_flush_out();
+    ps2_drain_output();
 
     if (mouse_dev_write(0xF4) != 0) {
         (void)mouse_init_plain_streaming();
     }
+
+    mouse_ps2_program_command_byte_irq();
+
+    /* Rehabilitar teclado en el primer puerto (0xAD lo desactivó al inicio). */
+    ps2_controller_cmd(PS2_CMD_ENABLE_KBD);
+    ps2_drain_output();
 
     __asm__ volatile("sti");
 
@@ -242,10 +299,34 @@ NexusStatus mouse_init(int32_t sw, int32_t sh) {
     return NEXUS_OK;
 }
 
+/*
+ * Máquina de estados: en cycle 0 solo acepta byte con bit 0x08 (sync).
+ * Cabecera en mitad de frame → resincronizar sin bloquear el drenaje del 8042.
+ */
 static int mouse_ps2_feed_byte(unsigned char data) {
     if (mouse_cycle == 0) {
-        if ((data & 0x08u) == 0)
+        if (!(data & 0x08u))
             return 1;
+        mouse_packet[0] = data;
+        mouse_cycle     = 1;
+        return 1;
+    }
+
+    if (mouse_cycle == 3) {
+        if ((data & 0x08u) != 0) {
+            /* Íbamos a por scroll pero llegó nueva cabecera: cerrar como 3-byte. */
+            mouse_enqueue_ps2_packet(0);
+            mouse_packet[0] = data;
+            mouse_cycle     = 1;
+            return 1;
+        }
+        mouse_packet[3] = data;
+        mouse_cycle     = 0;
+        mouse_enqueue_ps2_packet(1);
+        return 1;
+    }
+
+    if ((data & 0x08u) != 0 && (mouse_cycle == 1 || mouse_cycle == 2)) {
         mouse_packet[0] = data;
         mouse_cycle     = 1;
         return 1;
@@ -268,17 +349,6 @@ static int mouse_ps2_feed_byte(unsigned char data) {
         return 1;
     }
 
-    if ((data & 0x08u) != 0) {
-        mouse_packet_len = 3;
-        mouse_enqueue_ps2_packet(0);
-        mouse_packet[0] = data;
-        mouse_cycle     = 1;
-        return 1;
-    }
-
-    mouse_packet[3] = data;
-    mouse_cycle     = 0;
-    mouse_enqueue_ps2_packet(1);
     return 1;
 }
 

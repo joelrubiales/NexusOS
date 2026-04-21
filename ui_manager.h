@@ -33,6 +33,10 @@ void ui_manager_sync_focus_flags(void);
 /* Hit-test: solo is_hovered (no mueve el foco de teclado). */
 void ui_manager_update_hover(int mouse_x, int mouse_y);
 
+/* Índice en ui_elements[] bajo el cursor, o -1. */
+int ui_manager_hover_element_index(void);
+int ui_manager_element_is_hovered(int element_index);
+
 /*
  * Clic primario: foco si focusable, luego ui_activate_focused() (checkbox, botón…).
  * Devuelve 1 si el clic cayó sobre un nodo (consumido).

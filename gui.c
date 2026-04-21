@@ -25,6 +25,12 @@
 extern volatile unsigned char tecla_nueva;
 extern volatile uint64_t ticks;
 
+volatile bool ui_needs_update = true;
+
+void ui_mark_dirty(void) {
+    ui_needs_update = true;
+}
+
 /* ── Doble búfer estricto: kmalloc(pitch×height), mismo stride que el LFB ── */
 static uint32_t* gui_backbuffer;
 static int gui_fb_w, gui_fb_h, gui_fb_pitch;
@@ -69,6 +75,76 @@ void gui_draw_rect(int x, int y, int w, int h, uint32_t rgb) {
         uint32_t* row = gui_backbuffer + (size_t)(unsigned)j * (size_t)gui_stride_u32;
         for (i = x0; i < x1; i++)
             row[i] = rgb;
+    }
+}
+
+void gui_draw_image_rect(int x, int y, int src_x, int src_y, int src_w, int src_h, const Image* img) {
+    int ix, iy;
+    if (!gui_backbuffer || !img || !img->pixels || src_w <= 0 || src_h <= 0)
+        return;
+    if (src_x < 0 || src_y < 0 || src_x + src_w > img->width || src_y + src_h > img->height)
+        return;
+
+    for (iy = 0; iy < src_h; iy++) {
+        int dy = y + iy;
+        if (dy < 0 || dy >= gui_fb_h)
+            continue;
+        for (ix = 0; ix < src_w; ix++) {
+            int           dx = x + ix;
+            uint32_t      fg;
+            unsigned int  a;
+            size_t        di;
+            if (dx < 0 || dx >= gui_fb_w)
+                continue;
+            fg = img->pixels[(size_t)(src_y + iy) * (size_t)img->width + (size_t)(src_x + ix)];
+            a  = (fg >> 24) & 0xFFu;
+            if (a == 0u)
+                continue;
+            di = (size_t)(unsigned)dy * (size_t)gui_stride_u32 + (size_t)(unsigned)dx;
+            if (a == 255u)
+                gui_backbuffer[di] = fg & 0x00FFFFFFu;
+            else
+                gui_backbuffer[di] = gui_blend_colors(gui_backbuffer[di], fg) & 0x00FFFFFFu;
+        }
+    }
+}
+
+void gui_draw_image(int x, int y, const Image* img) {
+    if (!img || img->width < 1 || img->height < 1)
+        return;
+    gui_draw_image_rect(x, y, 0, 0, img->width, img->height, img);
+}
+
+void gui_draw_image_stretch(int x, int y, int dst_w, int dst_h, const Image* img) {
+    int dx, dy;
+    if (!gui_backbuffer || !img || !img->pixels || dst_w < 1 || dst_h < 1)
+        return;
+    if (img->width < 1 || img->height < 1)
+        return;
+
+    for (dy = 0; dy < dst_h; dy++) {
+        int sy = dy * img->height / dst_h;
+        int py = y + dy;
+        if (py < 0 || py >= gui_fb_h)
+            continue;
+        for (dx = 0; dx < dst_w; dx++) {
+            int           sx = dx * img->width / dst_w;
+            int           px = x + dx;
+            uint32_t      fg;
+            unsigned int  a;
+            size_t        di;
+            if (px < 0 || px >= gui_fb_w)
+                continue;
+            fg = img->pixels[(size_t)sy * (size_t)img->width + (size_t)sx];
+            a  = (fg >> 24) & 0xFFu;
+            if (a == 0u)
+                continue;
+            di = (size_t)(unsigned)py * (size_t)gui_stride_u32 + (size_t)(unsigned)px;
+            if (a == 255u)
+                gui_backbuffer[di] = fg & 0x00FFFFFFu;
+            else
+                gui_backbuffer[di] = gui_blend_colors(gui_backbuffer[di], fg) & 0x00FFFFFFu;
+        }
     }
 }
 
