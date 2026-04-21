@@ -297,6 +297,23 @@ SYSTEM_FILES: list[tuple[str, bytes]] = [
 ]
 
 
+# ─── Binarios userland (PIE) en /bin ───────────────────────────────────────
+def add_userland_elfs(tf: tarfile.TarFile):
+    base = os.path.join(os.path.dirname(__file__) or ".", "userland")
+    if not os.path.isdir(base):
+        return
+    for name in sorted(os.listdir(base)):
+        if not name.endswith(".elf"):
+            continue
+        path = os.path.join(base, name)
+        with open(path, "rb") as f:
+            blob = f.read()
+        tar_name = "bin/" + name
+        print(f"  → {tar_name} ({len(blob)} B) ...", end=" ", flush=True)
+        add_to_tar(tf, tar_name, blob)
+        print("OK")
+
+
 # ─── Empaquetar en TAR ─────────────────────────────────────────────────────
 def add_to_tar(tf: tarfile.TarFile, name: str, data: bytes):
     buf = io.BytesIO(data)
@@ -340,6 +357,8 @@ def main():
             print(f"  → {name} (32×32) ...", end=" ", flush=True)
             add_to_tar(tf, name, gen_fn())
             print("OK")
+
+        add_userland_elfs(tf)
 
     stat = os.stat(out)
     print(f"\nInitrd: {out}  ({stat.st_size // 1024} KiB)")

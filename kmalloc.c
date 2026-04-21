@@ -1,5 +1,6 @@
 #include "memory.h"
 #include "nexus.h"
+#include "smp.h"
 
 /* Pool fijo en RAM alta (mapa identidad @ KHEAP_PHYS_START). Lista enlazada best-fit. */
 
@@ -77,19 +78,22 @@ void kheap_panic_nomem(const char* msg) {
 void* kmalloc(uint64_t size) {
     HeapBlock *h, *best;
     uint64_t need_payload, need_total;
+    void* out;
 
     if (!heap_ready || size == 0) return 0;
+    if (smp_needs_locks())
+        spinlock_lock(&smp_kmalloc_lock);
 
     if (size > KHEAP_SIZE || size > (KHEAP_SIZE - KHEAP_OVERHEAD))
-        return 0;
+        goto km_fail;
 
     need_payload = align_up(size);
     if (need_payload < size)
-        return 0;
+        goto km_fail;
 
     need_total = KHEAP_OVERHEAD + need_payload;
     if (need_total < need_payload || need_total > KHEAP_SIZE)
-        return 0;
+        goto km_fail;
 
     best = 0;
     for (h = heap_head; h; h = h->next) {
@@ -98,7 +102,8 @@ void* kmalloc(uint64_t size) {
                 best = h;
         }
     }
-    if (!best) return 0;
+    if (!best)
+        goto km_fail;
 
     if (best->size >= need_payload + KHEAP_OVERHEAD + KHEAP_MIN_SPL) {
         HeapBlock* split =
@@ -111,16 +116,29 @@ void* kmalloc(uint64_t size) {
     }
 
     best->magic = KHMAG_USED;
-    return (unsigned char*)best + KHEAP_OVERHEAD;
+    out = (unsigned char*)best + KHEAP_OVERHEAD;
+    if (smp_needs_locks())
+        spinlock_unlock(&smp_kmalloc_lock);
+    return out;
+
+km_fail:
+    if (smp_needs_locks())
+        spinlock_unlock(&smp_kmalloc_lock);
+    return 0;
 }
 
 void kfree(void* ptr) {
     HeapBlock* h;
     if (!ptr || !heap_ready) return;
+    if (smp_needs_locks())
+        spinlock_lock(&smp_kmalloc_lock);
 
     h = (HeapBlock*)((unsigned char*)ptr - KHEAP_OVERHEAD);
-    if (h->magic != KHMAG_USED)
+    if (h->magic != KHMAG_USED) {
+        if (smp_needs_locks())
+            spinlock_unlock(&smp_kmalloc_lock);
         return;
+    }
 
     h->magic = KHMAG_FREE;
 
@@ -136,4 +154,6 @@ void kfree(void* ptr) {
             p->next = h->next;
         }
     }
+    if (smp_needs_locks())
+        spinlock_unlock(&smp_kmalloc_lock);
 }

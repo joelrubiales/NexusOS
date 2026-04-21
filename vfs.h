@@ -14,8 +14,11 @@
  * API:
  *   vfs_init()          — llamar una vez en kernel_main, tras memory_init().
  *   vfs_ready()         — 1 si hay initrd válido montado.
- *   vfs_find()          — devuelve puntero directo al contenido en la RAM
- *                         (cero copias), null si el archivo no existe.
+ *   vfs_find()          — busca primero en initrd.tar (zero-copy); si no hay
+ *                         coincidencia y Ext2 está montado, lee el fichero al
+ *                         heap (kmalloc). Si out_heap_owned != NULL: 0 = puntero
+ *                         al initrd (no liberar), 1 = kmalloc del kernel (kfree
+ *                         si el caller es dueño del buffer; p. ej. sys_close).
  *   vfs_load_bmp()      — decodifica un BMP 24/32-bit y devuelve un buffer
  *                         en el heap del kernel (kmalloc); se cachea.
  *   vfs_get_wallpaper() — carga /background.bmp una sola vez y cachea.
@@ -28,9 +31,9 @@
 void           vfs_init(uint32_t mod_start, uint32_t mod_end);
 int            vfs_ready(void);
 
-/* Busca 'path' en el initrd.tar. Devuelve puntero al payload o NULL.
- * Rellena *out_size con el tamaño real del archivo. */
-const uint8_t* vfs_find(const char* path, uint32_t* out_size);
+/* Busca path: initrd USTAR primero, luego Ext2 si está montado.
+ * Si out_heap_owned != NULL: 0 = datos en initrd; 1 = buffer kmalloc (liberar con kfree). */
+const uint8_t* vfs_find(const char* path, uint32_t* out_size, int* out_heap_owned);
 
 /*
  * Carga un BMP 24/32-bit en formato 0xAARRGGBB (= gfx_draw_image_rgba).

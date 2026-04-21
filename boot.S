@@ -70,8 +70,14 @@ gdt_start:
 	.quad 0x00cf9a000000ffff
 	/* 32-bit data ring 0 (selector 0x10). */
 	.quad 0x00cf92000000ffff
-	/* 64-bit code ring 0 (selector 0x18): base/limit ignorados; bit L en flags. */
+	/* 64-bit code ring 0 (selector 0x18): STAR/SYSCALL exige SS kernel = CS+8 → 0x20. */
 	.quad 0x00209a0000000000
+	/* 64-bit datos ring 0 (selector 0x20) — pila kernel en SYSCALL. */
+	.quad 0x00cf92000000ffff
+	/* Datos ring 3 (selector 0x28, RPL=3 → 0x2B). SYSRET: SS = STAR[63:48]+8. */
+	.quad 0x00cff2000000ffff
+	/* 64-bit code ring 3 (selector 0x30, RPL=3 → 0x33). SYSRET: CS = STAR[63:48]+16. */
+	.quad 0x0020fa0000000000
 gdt_end:
 
 .align 4
@@ -130,7 +136,8 @@ _start:
 	 */
 	movl	$0xC0000080, %ecx
 	rdmsr
-	orl	$(1 << 8), %eax
+	/* LME (8) + NXE (11): PTE bit 63 = NX para segmentos de datos usuario. */
+	orl	$(1 << 8 | 1 << 11), %eax
 	wrmsr
 
 	/*
@@ -203,6 +210,21 @@ setup_page_tables:
 	movw	%ax, %gs
 	movw	%ax, %ss
 	movq	$stack_top, %rsp
+
+	/*
+	 * FPU + SSE para el kernel (modo nativo x87, excepciones SIMD enmascaradas por MXCSR
+	 * hasta que el runtime lo fije; aquí solo habilitamos bits de control en CR0/CR4).
+	 * CR0: MP (1), NE (5); EM (2) = 0 — sin emulación, excepciones x87 nativas.
+	 * CR4: OSFXSR (9), OSXMMEXCPT (10) — FXSAVE/RSTOR y #XF para XMM.
+	 */
+	movq	%cr0, %rax
+	orq	$(1 << 1 | 1 << 5), %rax
+	andq	$~(1 << 2), %rax
+	movq	%rax, %cr0
+
+	movq	%cr4, %rax
+	orq	$(1 << 9 | 1 << 10 | 1 << 18), %rax
+	movq	%rax, %cr4
 
 	/* SysV AMD64: RDI = magic, RSI = dirección física MBI (zero-extend desde 32-bit). */
 	movl	mb2_boot_magic(%rip), %edi

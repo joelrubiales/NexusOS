@@ -3,13 +3,19 @@
 
 #include <stdint.h>
 
+#include "event.h"
+#include "event_queue.h"
+
 void keyboard_init(void);
 
-/* Llamar desde el ISR de IRQ1 tras leer 0x60 (y conocer si el byte es extendido).
- * Devuelve !=0 si la tecla no debe propagarse a tecla_nueva (p. ej. TAB en instalador). */
+void keyboard_event_flush_state(void);
+
+int keyboard_os_event_to_gui(const os_event_t* o, Event* out);
+
+/* Llamar desde el ISR de IRQ1 tras leer 0x60 (y conocer si el byte es extendido). */
 int keyboard_irq(uint8_t scancode, int extended_prefix);
 
-/* Bloquea hasta recibir un carácter imprimible, \\n, \\r, \\b, \\t o ESC (0x1B). */
+/* Bloquea hasta recibir un carácter imprimible vía la misma cola que la GUI. */
 char keyboard_getchar(void);
 
 #endif

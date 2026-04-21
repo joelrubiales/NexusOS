@@ -48,13 +48,12 @@ void obtener_fecha(char* buffer);
 
 /* ── IDT ──────────────────────────────────────────────────────────── */
 void instalar_idt(void);
+void idt_irq_install(uint8_t irq, void (*handler_asm)(void));
+void pic_irq_unmask(uint8_t irq);
 
 extern volatile unsigned char tecla_nueva;
 extern volatile unsigned char tecla_extended;
 extern volatile uint64_t ticks;
-
-/* Multiboot2 / GRUB: 0 = modo gráfico (mode=gui o por defecto), 1 = solo CLI (mode=cli). */
-extern int boot_mode;
 
 /* ── VESA text console (emulates VGA text on VESA framebuffer) ──── */
 extern int vesa_console_active;
@@ -65,6 +64,8 @@ int vc_get_rows(void);
 #define VC_COLS vc_get_cols()
 #define VC_ROWS vc_get_rows()
 extern unsigned char vesa_text_buf[];
+/* Cursor de texto compartido (shell + syscalls write a consola). */
+extern int nexus_tty_cursor;
 void vesa_console_init(void);
 void vesa_console_flush(void);
 void vesa_force_refresh(void);

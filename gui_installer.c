@@ -12,14 +12,15 @@
 #include "installer_ui.h"
 #include "memory.h"
 #include "mouse.h"
+#include "xhci.h"
 #include "nexus.h"
 #include "window.h"
 #include "event.h"
+#include "ui_manager.h"
+#include "gfx.h"
 #include <stdint.h>
 
 extern volatile uint64_t ticks;
-
-#define INSTALLER_BG RGB(28, 34, 48)
 
 static void installer_paint_frame(void) {
     int sw = gfx_width();
@@ -54,8 +55,7 @@ static void installer_paint_frame(void) {
     win.is_active  = 1;
     win.z_index    = 100;
 
-    gfx_fill_screen_solid(INSTALLER_BG);
-    draw_window(&win);
+    gfx_fill_screen_solid((unsigned int)(COLOR_DESKTOP_BG & 0xFFFFFFu));
     draw_installer_content(&win);
 }
 
@@ -72,103 +72,104 @@ void init_desktop(void) {
         }
         if (vesa_console_active)
             vesa_force_refresh();
-        mouse_init((int)vbi.width, (int)vbi.height);
+        (void)mouse_init((int32_t)vbi.width, (int32_t)vbi.height);
+        xhci_set_screen_dims((int)vbi.width, (int)vbi.height);
     } else {
         gfx_init_vga();
-        mouse_init(320, 200);
+        (void)mouse_init(320, 200);
+        xhci_set_screen_dims(320, 200);
     }
 
     gfx_layout_refresh();
     vesa_console_active = 0;
 }
 
+static void installer_process_events(void) {
+    Event ev;
+    while (pop_event(&ev)) {
+        switch (ev.type) {
+        case EVENT_MOUSE_MOVE:
+            if (ui_element_count > 0)
+                ui_manager_update_hover(ev.mouse_x, ev.mouse_y);
+            break;
+        case EVENT_MOUSE_CLICK:
+            if (ev.mouse_pressed && (ev.mouse_buttons & 1) && ui_element_count > 0)
+                (void)ui_manager_handle_primary_click(ev.mouse_x, ev.mouse_y);
+            break;
+        case EVENT_KEY_PRESS:
+            if (ui_element_count <= 0)
+                break;
+
+            /* Flechas (Set 1 extendido): navegar el anillo de foco. */
+            if (ev.key_extended) {
+                if (ev.scancode == 0x50u || ev.scancode == 0x4Du) /* Down, Right */
+                    ui_focus_tab_next();
+                else if (ev.scancode == 0x48u || ev.scancode == 0x4Bu) /* Up, Left */
+                    ui_focus_tab_prev();
+                ui_manager_sync_focus_flags();
+                break;
+            }
+
+            if (ev.scancode == 0x0Fu) { /* Tab */
+                ui_focus_tab_next();
+                ui_manager_sync_focus_flags();
+                break;
+            }
+
+            if (ev.scancode == 0x1Cu) { /* Enter → activar widget enfocado */
+                ui_activate_focused();
+                break;
+            }
+
+            if (focused_element_index >= 0 && focused_element_index < ui_element_count) {
+                UI_Element* fel = &ui_elements[focused_element_index];
+                if (fel->on_keypress) {
+                    if (ev.ascii)
+                        fel->on_keypress(ev.ascii);
+                    break;
+                }
+                if (fel->type == UI_TYPE_TEXT_INPUT) {
+                    if (ev.scancode == 0x0Eu)
+                        ui_handle_char('\b');
+                    else if (ev.ascii >= 32)
+                        ui_handle_char((unsigned char)ev.ascii);
+                }
+            }
+            break;
+        case EVENT_WINDOW_CLOSE:
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+void installer_desktop_step(void) {
+    /*
+     * 1) Pintar → registra widgets + anillo de foco (Tab coherente con el paso).
+     * 2) Eventos → teclado/ratón actualizan buffers y foco.
+     * 3) Pintar de nuevo → refleja texto/foco en el mismo frame.
+     */
+    installer_paint_frame();
+    installer_process_events();
+    installer_paint_frame();
+    gfx_layout_refresh();
+    gfx_draw_cursor((int)mouse_get_x(), (int)mouse_get_y());
+    gfx_mark_present_full();
+    swap_buffers();
+}
+
 void start_gui_installer(void) {
     uint64_t last_frame = 0;
 
-    /* Descartar eventos acumulados durante el arranque. */
     flush_events();
 
     for (;;) {
-        /* ── Limitar a ~30 fps (ticks a 1000 Hz → esperar ≥2 ticks) ─── */
         if (ticks - last_frame < 2) {
             __asm__ volatile("hlt");
             continue;
         }
         last_frame = ticks;
-
-        /* ════════════════════════════════════════════════════════════════
-         * BUCLE DE MENSAJES — procesar TODOS los eventos pendientes antes
-         * de redibujar el frame.
-         * ════════════════════════════════════════════════════════════════ */
-        {
-            Event ev;
-            while (pop_event(&ev)) {
-                switch (ev.type) {
-
-                /* ── Movimiento de ratón: actualizar foco hover ──────── */
-                case EVENT_MOUSE_MOVE:
-                    if (ui_element_count > 0)
-                        ui_update_focus_from_mouse(ev.mouse_x, ev.mouse_y);
-                    break;
-
-                /* ── Clic de ratón: activar elemento bajo el cursor ──── */
-                case EVENT_MOUSE_CLICK:
-                    if (ev.mouse_pressed && (ev.mouse_buttons & 1) &&
-                        ui_element_count > 0) {
-                        int hit = ui_get_element_at(ev.mouse_x, ev.mouse_y);
-                        if (hit >= 0) {
-                            focused_element_index = hit;
-                            ui_activate_focused();
-                        }
-                    }
-                    break;
-
-                /* ── Tecla pulsada ───────────────────────────────────── */
-                case EVENT_KEY_PRESS:
-                    if (ui_element_count > 0 &&
-                        focused_element_index >= 0 &&
-                        focused_element_index < ui_element_count &&
-                        ui_elements[focused_element_index].type == UI_TYPE_TEXT_INPUT) {
-
-                        /* Dentro de un TEXT_INPUT */
-                        if (ev.scancode == 0x0Eu) {
-                            /* Backspace */
-                            ui_handle_char('\b');
-                        } else if (ev.scancode == 0x0Fu || ev.scancode == 0x1Cu) {
-                            /* TAB / Enter: avanzar foco */
-                            ui_focus_advance();
-                        } else if (ev.ascii >= 32) {
-                            /* Carácter imprimible */
-                            ui_handle_char((unsigned char)ev.ascii);
-                        }
-
-                    } else if (ui_element_count > 0) {
-
-                        /* Navegación general entre widgets */
-                        if (ev.scancode == 0x0Fu) {
-                            /* TAB: siguiente elemento */
-                            ui_focus_advance();
-                        } else if (ev.scancode == 0x1Cu) {
-                            /* Enter: activar elemento enfocado */
-                            ui_activate_focused();
-                        }
-                    }
-                    break;
-
-                case EVENT_WINDOW_CLOSE:
-                    /* El instalador no gestiona cierres de ventana. */
-                    break;
-
-                default:
-                    break;
-                }
-            }
-        }
-
-        /* ── Renderizar frame ────────────────────────────────────────── */
-        gfx_layout_refresh();
-        installer_paint_frame();
-        gfx_draw_cursor(mouse_x, mouse_y);
-        swap_buffers();
+        installer_desktop_step();
     }
 }

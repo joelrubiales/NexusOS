@@ -48,7 +48,7 @@ void keyboard_body(void) {
     if (_ext_pending) { _ext_pending = 0; tecla_extended = 1; }
     else              { tecla_extended = 0; }
 
-    /* Empuja KEY_PRESS al event queue y mantiene kbd_buf (para CLI shell). */
+    /* Encola KEY_EVENT crudo; pop_event / keyboard_getchar traducen. */
     keyboard_irq(sc, tecla_extended);
 
     /* Ruta legacy: gui_run() todavía procesa tecla_nueva con KbdState. */
@@ -107,4 +107,19 @@ void instalar_idt(void) {
 
     __asm__ volatile("lidt %0" : : "m"(idtp));
     __asm__ volatile("sti");
+}
+
+void idt_irq_install(uint8_t irq, void (*handler_asm)(void)) {
+    if (irq >= 16u || !handler_asm)
+        return;
+    set_idt_gate(32 + (int)irq, handler_asm);
+}
+
+void pic_irq_unmask(uint8_t irq) {
+    if (irq >= 16u)
+        return;
+    if (irq < 8u)
+        outb(0x21, (unsigned char)(inb(0x21) & (unsigned char)~(1u << irq)));
+    else
+        outb(0xA1, (unsigned char)(inb(0xA1) & (unsigned char)~(1u << (irq - 8u))));
 }

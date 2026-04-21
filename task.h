@@ -39,6 +39,9 @@ void     sched_init(void);
  */
 int      sched_new_task(void (*entry)(void), const char* name);
 
+/* Ring 3: RIP y RSP usuario (tras iretq). Devuelve índice de tarea o -1. */
+int      sched_new_user_task(uint64_t user_rip, uint64_t user_rsp, const char* name);
+
 /* Marca la tarea actual como DEAD (llamar desde el cuerpo de una tarea al terminar). */
 void     sched_task_exit(void);
 
@@ -48,6 +51,9 @@ void     sched_task_exit(void);
  * nuevo RSP al que debe cambiar el handler (misma tarea si no hay switch).
  */
 uint64_t sched_tick(uint64_t current_rsp);
+
+/* Índice de la tarea en ejecución (0 .. sched_task_count-1). Válido en syscalls / IRQ. */
+int sched_current_tid(void);
 
 /* 0 = solo tick sin switch; 1 = preemption activa. */
 extern volatile int sched_enabled;

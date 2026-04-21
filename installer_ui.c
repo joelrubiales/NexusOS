@@ -9,6 +9,7 @@
 #include "installer_ui.h"
 #include "gui.h"
 #include "gfx.h"
+#include "ui_manager.h"
 #include "mouse.h"
 #include "nexus.h"
 #include "font_aa.h"
@@ -20,20 +21,19 @@
 #define SIDEBAR_W_MAX  200
 #define SIDEBAR_W_FRAC 4   /* 1/4 del ancho del contenido */
 
-/* Colores de la barra lateral (dark navy, ~80 % opacidad). */
-#define SIDEBAR_BG_RGB   RGB(14, 21, 45)
-#define SIDEBAR_BG_ALPHA 204u          /* 204/255 ≈ 80 % */
-#define SIDEBAR_ACCENT   RGB(0, 120, 220)
-#define SIDEBAR_TEXT     RGB(195, 205, 230)
-#define SIDEBAR_DONE     RGB(50, 180, 80)
-#define SIDEBAR_DIM      RGB(80, 100, 145)
+#define INS_RGB(c)      ((unsigned int)((c) & 0xFFFFFFu))
+#define OPAQUE_ARGB(c)  ((uint32_t)(((c) & 0xFFFFFFu) | 0xFF000000u))
+
+/* Botones: padding mínimo vertical recomendado GTK (~10 px). */
+#define BTN_PAD_MIN_V   10
+#define BTN_PAD_MIN_H   10
+#define BTN_CORNER_R    10
 
 /* Radio del círculo de indicador de paso. */
 #define STEP_DOT_R 7
 
-/* Colores de la tarjeta de contenido. */
-#define CARD_RADIUS  14
-#define CARD_SHADOW  10   /* spread de sombra */
+#define SIDEBAR_DONE    RGB(46, 155, 95)
+#define SIDEBAR_MUTED   RGB(130, 135, 145)
 
 InstallerState current_step = WELCOME;
 
@@ -218,41 +218,108 @@ static void extr_advance_frame(void) {
 static void installer_client_rect(const Window* w,
                                   int* cx, int* cy, int* cw, int* ch) {
     *cx = w->x + INSTALLER_WIN_INSET;
-    *cy = w->y + INSTALLER_WIN_TITLE_H + 2;
+    *cy = w->y + INSTALLER_WIN_TITLE_H + 4;
     *cw = w->width  - 2 * INSTALLER_WIN_INSET;
-    *ch = w->height - INSTALLER_WIN_TITLE_H - 6;
+    *ch = w->height - INSTALLER_WIN_TITLE_H - 10;
 }
 
-/* ── draw_labeled_button: dibuja un botón con focus ring opcional ─────────── */
-static void draw_labeled_button(int x, int y, int bw, int bh,
-                                const char* label,
-                                unsigned int bg, unsigned int stroke_rgb,
-                                int focused) {
-    int tw = gfx_aa_text_w(label, 1);
-    int tx = x + (bw - tw) / 2;
-    int ty = y + (bh - FONT_AA_GLYPH_H) / 2;
-    if (focused) {
-        gfx_rounded_rect_stroke_aa(x - 4, y - 4, bw + 8, bh + 8, 12,
-                                   RGB(0, 255, 240));
-        gfx_rounded_rect_stroke_aa(x - 2, y - 2, bw + 4, bh + 4, 10,
-                                   RGB(160, 255, 248));
+/* Radio y sombra del panel principal (estilo ventana macOS / glass). */
+#define INSTALLER_SHELL_RADIUS  12
+#define INSTALLER_SHADOW_SPREAD 20
+
+/*
+ * Panel flotante: sombra redondeada profunda + relleno glass + título.
+ */
+static void installer_draw_floating_shell(const Window* w) {
+    int         x, y, ww, hh;
+    const char* t;
+    int         R = INSTALLER_SHELL_RADIUS;
+
+    if (!w || !w->is_visible)
+        return;
+    x  = w->x;
+    y  = w->y;
+    ww = w->width;
+    hh = w->height;
+    if (ww < 120 || hh < 80)
+        return;
+
+    /* Tinte sombra: gris muy oscuro (no negro puro). */
+    draw_drop_shadow(x, y, ww, hh, R, INSTALLER_SHADOW_SPREAD, 0xFF2C2C2Eu);
+    draw_rounded_rect_filled(x, y, ww, hh, R, COLOR_BG_WINDOW);
+
+    /* Velo “mica” sobre el cuerpo (debajo del título), CPU puro. */
+    if (hh > INSTALLER_WIN_TITLE_H + 16) {
+        int mx = x + 2;
+        int my = y + INSTALLER_WIN_TITLE_H - 2;
+        int mw = ww - 4;
+        int mh = hh - INSTALLER_WIN_TITLE_H;
+        int mr = R > 6 ? R - 4 : 4;
+        if (mr > mw / 2)
+            mr = mw / 2;
+        if (mr > mh / 2)
+            mr = mh / 2;
+        gfx_rect_mica(mx, my, mw, mh, mr, 0xFFFFFFu, 38u);
     }
-    gfx_fill_rounded_rect(x, y, bw, bh, 8, bg);
-    gfx_rounded_rect_stroke_aa(x, y, bw, bh, 8, stroke_rgb);
-    gfx_aa_text(tx, ty, label, RGB(255, 255, 255), 1);
+
+    t = w->title ? w->title : "Instalador";
+    {
+        int tw = gfx_aa_text_w(t, 1);
+        int tx = x + (ww - tw) / 2;
+        int ty = y + 16;
+        if (tx < x + 24)
+            tx = x + 24;
+        gfx_aa_text(tx, ty, t, INS_RGB(COLOR_TEXT_PRIMARY), 1);
+    }
+    gfx_blend_rect(x + R + 4, y + 46, ww - 2 * (R + 4), 2, INS_RGB(COLOR_BORDER), 34);
+}
+
+/*
+ * btn_style: 0 = secundario (neutro), 1 = primario (accent), 2 = destructivo (rojo apagado).
+ */
+static void draw_labeled_button(int x, int y, int bw, int bh,
+                                const char* label, int btn_style, int focused) {
+    int          tw = gfx_aa_text_w(label, 1);
+    int          tx = x + (bw - tw) / 2;
+    int          ty = y + (bh - FONT_AA_GLYPH_H) / 2;
+    unsigned int fg;
+    uint32_t     fill;
+
+    (void)BTN_PAD_MIN_H;
+    if (bh < FONT_AA_GLYPH_H + 2 * BTN_PAD_MIN_V)
+        ty = y + (bh - FONT_AA_GLYPH_H) / 2;
+
+    (void)focused; /* anillo de foco: ui_manager_draw_focus_rings() */
+
+    if (btn_style == 2) {
+        fill = ARGB(255, 186, 72, 68);
+        fg   = RGB(255, 252, 252);
+    } else if (btn_style == 1) {
+        fill = OPAQUE_ARGB(COLOR_ACCENT);
+        fg   = RGB(255, 255, 255);
+    } else {
+        fill = ARGB(255, 252, 252, 254);
+        fg   = INS_RGB(COLOR_TEXT_PRIMARY);
+    }
+    gfx_fill_rounded_rect_aa(x, y, bw, bh, BTN_CORNER_R, fill);
+    if (btn_style == 0)
+        gfx_blend_rect(x + 2, y + bh - 2, bw - 4, 1, INS_RGB(COLOR_BORDER), 45);
+
+    gfx_aa_text(tx, ty, label, fg, 1);
 }
 
 static void draw_lang_option(int x, int y, int w, int h,
                              const char* name, int selected) {
-    unsigned int bg     = selected ? RGB(220, 235, 255) : RGB(240, 242, 248);
-    unsigned int fg     = selected ? RGB(20, 50, 120)   : RGB(60, 62, 72);
-    unsigned int border = selected ? RGB(0, 100, 220)   : RGB(190, 195, 210);
-    gfx_fill_rounded_rect(x, y, w, h, 6, bg);
-    gfx_rounded_rect_stroke_aa(x, y, w, h, 6, border);
+    unsigned int fg = selected ? INS_RGB(COLOR_ACCENT) : INS_RGB(COLOR_TEXT_PRIMARY);
+    gfx_fill_rounded_rect_aa(x, y, w, h, 8, OPAQUE_ARGB(COLOR_BG_WINDOW));
+    if (selected)
+        gfx_blend_rect(x, y, w, h, INS_RGB(COLOR_ACCENT), 22);
+    else
+        gfx_blend_rect(x, y, w, h, RGB(248, 249, 251), 55);
     gfx_aa_text(x + 14, y + (h - FONT_AA_GLYPH_H) / 2, name, fg, 1);
     if (selected)
         gfx_aa_text(x + w - 36, y + (h - FONT_AA_GLYPH_H) / 2,
-                    "[*]", RGB(0, 120, 220), 1);
+                    "[*]", INS_RGB(COLOR_ACCENT), 1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -266,10 +333,10 @@ static void draw_welcome(int cx, int cy, int cw, int ch) {
     int         ty  = cy + 24;
     if (tx < cx + 8) tx = cx + 8;
 
-    gfx_aa_text(tx, ty, headline, RGB(28, 32, 44), title_scale);
+    gfx_aa_text(tx, ty, headline, INS_RGB(COLOR_TEXT_PRIMARY), title_scale);
     gfx_aa_text(cx + 24, ty + gfx_aa_line_h(title_scale) + 8,
                 "Elija el idioma del asistente y del sistema instalado.",
-                RGB(90, 95, 110), 1);
+                SIDEBAR_MUTED, 1);
 
     {
         int ly  = ty + gfx_aa_line_h(title_scale) + 44;
@@ -303,12 +370,11 @@ static void draw_welcome(int cx, int cy, int cw, int ch) {
     }
 
     {
-        int bw = 150, bh = 42;
+        int bw = 168, bh = 44;
         int bx = cx + cw - bw - 24;
         int by = cy + ch - bh - 20;
         int fi = ui_push_button(1, bx, by, bw, bh, cb_welcome_next);
-        draw_labeled_button(bx, by, bw, bh, "Continuar",
-                            RGB(0, 122, 245), RGB(20, 60, 140),
+        draw_labeled_button(bx, by, bw, bh, "Continuar", 1,
                             fi >= 0 && focused_element_index == fi);
     }
 }
@@ -321,10 +387,10 @@ static void draw_locale_step(int cx, int cy, int cw, int ch) {
     int fi;
 
     gfx_aa_text(cx + 20, cy + 16, "Region y zona horaria",
-                RGB(28, 32, 44), 2);
+                INS_RGB(COLOR_TEXT_PRIMARY), 2);
     gfx_aa_text(cx + 20, cy + 16 + gfx_aa_line_h(2) + 4,
                 "Seleccione su ubicacion. El instalador usara Europa/Madrid por defecto.",
-                RGB(80, 85, 100), 1);
+                SIDEBAR_MUTED, 1);
 
     /* Mapa mundial estilizado (elipse + grilla + marcadores) */
     mx = cx + 24;
@@ -378,12 +444,11 @@ static void draw_locale_step(int cx, int cy, int cw, int ch) {
     }
 
     {
-        int bw = 150, bh = 42;
+        int bw = 168, bh = 44;
         int bx = cx + cw - bw - 24;
         int by = cy + ch - bh - 20;
         fi = ui_push_button(100, bx, by, bw, bh, cb_locale_next);
-        draw_labeled_button(bx, by, bw, bh, "Continuar",
-                            RGB(0, 122, 245), RGB(20, 60, 140),
+        draw_labeled_button(bx, by, bw, bh, "Continuar", 1,
                             fi >= 0 && focused_element_index == fi);
     }
 }
@@ -399,57 +464,55 @@ static void draw_user_account_step(int cx, int cy, int cw, int ch) {
     int fi, idx;
 
     gfx_aa_text(cx + 20, cy + 16, "Cree su cuenta",
-                RGB(28, 32, 44), 2);
+                INS_RGB(COLOR_TEXT_PRIMARY), 2);
     gfx_aa_text(cx + 20, cy + 16 + gfx_aa_line_h(2) + 4,
                 "Nombre para mostrar, usuario, contrasena y nombre del equipo.",
-                RGB(80, 85, 100), 1);
+                SIDEBAR_MUTED, 1);
 
     label_y = cy + 88;
     field_y = label_y + FONT_AA_GLYPH_H + 6;
 
     gfx_aa_text(field_x, label_y, "Nombre del equipo (hostname):",
-                RGB(60, 65, 82), 1);
+                SIDEBAR_MUTED, 1);
     idx = ui_push_text_input(200, field_x, field_y, field_w, field_h,
                               "nexusos", 0);
     if (ins_hostname[0]) restore_text_input(idx, ins_hostname);
 
     label_y = field_y + field_h + 18;
     field_y = label_y + FONT_AA_GLYPH_H + 6;
-    gfx_aa_text(field_x, label_y, "Su nombre:", RGB(60, 65, 82), 1);
+    gfx_aa_text(field_x, label_y, "Su nombre:", SIDEBAR_MUTED, 1);
     idx = ui_push_text_input(201, field_x, field_y, field_w, field_h,
                               "Linus Torvalds", 0);
     if (ins_display_name[0]) restore_text_input(idx, ins_display_name);
 
     label_y = field_y + field_h + 18;
     field_y = label_y + FONT_AA_GLYPH_H + 6;
-    gfx_aa_text(field_x, label_y, "Nombre de usuario:", RGB(60, 65, 82), 1);
+    gfx_aa_text(field_x, label_y, "Nombre de usuario:", SIDEBAR_MUTED, 1);
     idx = ui_push_text_input(202, field_x, field_y, field_w, field_h,
                               "linus", 0);
     if (ins_username[0]) restore_text_input(idx, ins_username);
 
     label_y = field_y + field_h + 18;
     field_y = label_y + FONT_AA_GLYPH_H + 6;
-    gfx_aa_text(field_x, label_y, "Contrasena:", RGB(60, 65, 82), 1);
+    gfx_aa_text(field_x, label_y, "Contrasena:", SIDEBAR_MUTED, 1);
     idx = ui_push_text_input(203, field_x, field_y, field_w, field_h,
                               "********", 1);
     if (ins_password[0]) restore_text_input(idx, ins_password);
 
     {
-        int bw = 120, bh = 40;
+        int bw = 132, bh = 44;
         int bx = cx + 24;
         int by = cy + ch - bh - 20;
         fi = ui_push_button(204, bx, by, bw, bh, cb_user_back);
-        draw_labeled_button(bx, by, bw, bh, "Atras",
-                            RGB(150, 155, 168), RGB(80, 85, 98),
+        draw_labeled_button(bx, by, bw, bh, "Atras", 0,
                             fi >= 0 && focused_element_index == fi);
     }
     {
-        int bw = 150, bh = 40;
+        int bw = 168, bh = 44;
         int bx = cx + cw - bw - 24;
         int by = cy + ch - bh - 20;
         fi = ui_push_button(205, bx, by, bw, bh, cb_user_next);
-        draw_labeled_button(bx, by, bw, bh, "Continuar",
-                            RGB(0, 122, 245), RGB(20, 60, 140),
+        draw_labeled_button(bx, by, bw, bh, "Continuar", 1,
                             fi >= 0 && focused_element_index == fi);
     }
 }
@@ -466,7 +529,7 @@ static void draw_disk_setup(int cx, int cy, int cw, int ch) {
     int fi, i;
 
     gfx_aa_text(cx + 20, disk_y, "Particionado del disco",
-                RGB(28, 32, 44), 2);
+                INS_RGB(COLOR_TEXT_PRIMARY), 2);
     disk_y += gfx_aa_line_h(2) + 8;
 
     gfx_aa_text(cx + 20, disk_y, "/dev/sda  (100 GB) — ATA Disk",
@@ -525,21 +588,19 @@ static void draw_disk_setup(int cx, int cy, int cw, int ch) {
     }
 
     {
-        int bw = 120, bh = 40;
+        int bw = 132, bh = 44;
         int bx = cx + 24;
         int by = cy + ch - bh - 20;
         fi = ui_push_button(32, bx, by, bw, bh, cb_disk_back);
-        draw_labeled_button(bx, by, bw, bh, "Atras",
-                            RGB(150, 155, 168), RGB(80, 85, 98),
+        draw_labeled_button(bx, by, bw, bh, "Atras", 0,
                             fi >= 0 && focused_element_index == fi);
     }
     {
-        int bw = 150, bh = 40;
+        int bw = 168, bh = 44;
         int bx = cx + cw - bw - 24;
         int by = cy + ch - bh - 20;
         fi = ui_push_button(33, bx, by, bw, bh, cb_disk_next);
-        draw_labeled_button(bx, by, bw, bh, "Continuar",
-                            RGB(0, 122, 245), RGB(20, 60, 140),
+        draw_labeled_button(bx, by, bw, bh, "Continuar", 1,
                             fi >= 0 && focused_element_index == fi);
     }
 }
@@ -557,10 +618,10 @@ static void draw_summary_step(int cx, int cy, int cw, int ch) {
     const char* a;
 
     gfx_aa_text(cx + 20, cy + 16, "Resumen de la instalacion",
-                RGB(28, 32, 44), 2);
+                INS_RGB(COLOR_TEXT_PRIMARY), 2);
     gfx_aa_text(cx + 20, cy + 16 + gfx_aa_line_h(2) + 4,
                 "Revise los datos antes de escribir en el disco.",
-                RGB(80, 85, 100), 1);
+                SIDEBAR_MUTED, 1);
 
     y = cy + 72;
     gfx_aa_text(lx, y, "Idioma",     RGB(110, 115, 130), 1);
@@ -600,17 +661,15 @@ static void draw_summary_step(int cx, int cy, int cw, int ch) {
         int bx = cx + 24;
         int by = cy + ch - bh - 20;
         fi = ui_push_button(40, bx, by, bw, bh, cb_summary_back);
-        draw_labeled_button(bx, by, bw, bh, "Atras",
-                            RGB(150, 155, 168), RGB(80, 85, 98),
+        draw_labeled_button(bx, by, bw, bh, "Atras", 0,
                             fi >= 0 && focused_element_index == fi);
     }
     {
-        int bw = 180, bh = 42;
+        int bw = 196, bh = 44;
         int bx = cx + cw - bw - 24;
         int by = cy + ch - bh - 20;
         fi = ui_push_button(41, bx, by, bw, bh, cb_summary_install);
-        draw_labeled_button(bx, by, bw, bh, "Instalar ahora",
-                            RGB(0, 122, 245), RGB(20, 60, 140),
+        draw_labeled_button(bx, by, bw, bh, "Instalar ahora", 1,
                             fi >= 0 && focused_element_index == fi);
     }
 }
@@ -628,9 +687,8 @@ static void draw_destructive_modal(int cx, int cy, int cw, int ch) {
     mx = cx + (cw - mw) / 2;
     my = cy + (ch - mh) / 2;
 
-    gfx_drop_shadow_soft(mx, my, mw, mh, 16, 12);
-    gfx_fill_rounded_rect_aa(mx, my, mw, mh, 16, RGB(52, 8, 12));
-    gfx_rounded_rect_stroke_aa(mx, my, mw, mh, 16, RGB(140, 40, 45));
+    draw_drop_shadow(mx, my, mw, mh, 16, 16, 0xFF2C2C2Eu);
+    draw_rounded_rect_filled(mx, my, mw, mh, 16, ARGB(255, 62, 36, 38));
 
     {
         int tx = mx + 36, ty = my + 36;
@@ -654,21 +712,19 @@ static void draw_destructive_modal(int cx, int cy, int cw, int ch) {
                 RGB(235, 210, 210), 1);
 
     {
-        int bw = 120, bh = 38;
+        int bw = 132, bh = 42;
         int bx = mx + 24;
         int by = my + mh - bh - 20;
         fi = ui_push_button(300, bx, by, bw, bh, cb_warn_cancel);
-        draw_labeled_button(bx, by, bw, bh, "Cancelar",
-                            RGB(120, 125, 138), RGB(70, 75, 88),
+        draw_labeled_button(bx, by, bw, bh, "Cancelar", 0,
                             fi >= 0 && focused_element_index == fi);
     }
     {
-        int bw = 130, bh = 38;
-        int bx = mx + mw - 130 - 24;
+        int bw = 148, bh = 42;
+        int bx = mx + mw - bw - 24;
         int by = my + mh - bh - 20;
         fi = ui_push_button(301, bx, by, bw, bh, cb_warn_confirm);
-        draw_labeled_button(bx, by, bw, bh, "Borrar disco",
-                            RGB(220, 50, 55), RGB(120, 20, 25),
+        draw_labeled_button(bx, by, bw, bh, "Borrar disco", 2,
                             fi >= 0 && focused_element_index == fi);
     }
 }
@@ -803,37 +859,35 @@ static void draw_finished(int cx, int cy, int cw, int ch) {
     const char* l3  = "para comenzar a usar NexusOS.";
     int tw, y;
 
-    gfx_fill_circle(mx, my, 36, RGB(46, 180, 80));
-    gfx_circle_outline_aa(mx, my, 36, RGB(20, 100, 40));
+    gfx_fill_circle(mx, my, 36, SIDEBAR_DONE);
+    gfx_circle_outline_aa(mx, my, 36, RGB(36, 120, 72));
     gfx_wu_line(mx - 14, my, mx - 4, my + 14, RGB(255, 255, 255));
     gfx_wu_line(mx - 4, my + 14, mx + 22, my - 18, RGB(255, 255, 255));
 
     y  = my + 52;
     tw = gfx_aa_text_w(l1, 2);
-    gfx_aa_text(mx - tw/2, y, l1, RGB(28, 32, 44), 2);
+    gfx_aa_text(mx - tw/2, y, l1, INS_RGB(COLOR_TEXT_PRIMARY), 2);
     y += gfx_aa_line_h(2);
     tw = gfx_aa_text_w(l2, 1);
-    gfx_aa_text(cx + (cw - tw)/2, y, l2, RGB(55, 60, 72), 1);
+    gfx_aa_text(cx + (cw - tw)/2, y, l2, SIDEBAR_MUTED, 1);
     y += gfx_aa_line_h(1);
     tw = gfx_aa_text_w(l3, 1);
-    gfx_aa_text(cx + (cw - tw)/2, y, l3, RGB(55, 60, 72), 1);
+    gfx_aa_text(cx + (cw - tw)/2, y, l3, SIDEBAR_MUTED, 1);
 
     {
-        int bw = 160, bh = 42;
+        int bw = 168, bh = 44;
         int bx = cx + cw - 2 * bw - 32;
         int by = cy + ch - bh - 20;
         int fi = ui_push_button(5, bx, by, bw, bh, cb_view_log);
-        draw_labeled_button(bx, by, bw, bh, "Ver registro",
-                            RGB(150, 155, 168), RGB(80, 85, 98),
+        draw_labeled_button(bx, by, bw, bh, "Ver registro", 0,
                             fi >= 0 && focused_element_index == fi);
     }
     {
-        int bw = 170, bh = 42;
+        int bw = 188, bh = 44;
         int bx = cx + cw - bw - 24;
         int by = cy + ch - bh - 20;
         int fi = ui_push_button(4, bx, by, bw, bh, cb_reboot);
-        draw_labeled_button(bx, by, bw, bh, "Reiniciar ahora",
-                            RGB(0, 122, 245), RGB(20, 60, 140),
+        draw_labeled_button(bx, by, bw, bh, "Reiniciar ahora", 1,
                             fi >= 0 && focused_element_index == fi);
     }
 }
@@ -842,29 +896,25 @@ static void draw_finished(int cx, int cy, int cw, int ch) {
  *  Barra lateral — lista de pasos con indicadores visuales.
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void draw_installer_sidebar(int sx, int sy, int sw, int sh) {
-    /* ── Fondo: 80 % de opacidad de navy sobre el blanco de la ventana ── */
-    gfx_blend_rect(sx, sy, sw, sh, SIDEBAR_BG_RGB, SIDEBAR_BG_ALPHA);
+    unsigned int accent = INS_RGB(COLOR_ACCENT);
 
-    /* ── Franja acentuada en el borde superior ─────────────────────── */
-    gfx_fill_rect(sx, sy, sw, 3, SIDEBAR_ACCENT);
+    gfx_fill_rounded_rect_aa(sx, sy, sw, sh, 4, ARGB(255, 244, 245, 248));
+    gfx_blend_rect(sx, sy, sw, sh, INS_RGB(COLOR_BORDER), 18);
+    gfx_blend_rect(sx, sy, sw, 3, accent, 90);
 
-    /* ── Logotipo / nombre del SO ────────────────────────────────────── */
     {
         int logo_y = sy + 18;
         int dot_r  = 8;
         int dot_cx = sx + dot_r + 14;
 
-        /* Círculo coloreado (logo simplificado) */
-        gfx_fill_circle(dot_cx, logo_y + dot_r, dot_r, SIDEBAR_ACCENT);
-        gfx_circle_outline_aa(dot_cx, logo_y + dot_r, dot_r, RGB(80, 160, 255));
+        gfx_fill_circle(dot_cx, logo_y + dot_r, dot_r, accent);
+        gfx_circle_outline_aa(dot_cx, logo_y + dot_r, dot_r, RGB(130, 175, 235));
 
-        /* Nombre */
         gfx_aa_text(dot_cx + dot_r + 8, logo_y + 1, "NexusOS",
-                    RGB(235, 240, 255), 1);
+                    INS_RGB(COLOR_TEXT_PRIMARY), 1);
     }
 
-    /* ── Línea divisoria tras el logo ────────────────────────────────── */
-    gfx_blend_rect(sx + 12, sy + 44, sw - 24, 1, RGB(80, 110, 175), 120);
+    gfx_blend_rect(sx + 12, sy + 44, sw - 24, 2, INS_RGB(COLOR_BORDER), 35);
 
     /* ── Lista de pasos ──────────────────────────────────────────────── */
     static const char* step_labels[] = {
@@ -890,7 +940,7 @@ static void draw_installer_sidebar(int sx, int sy, int sw, int sh) {
         if (is_current) {
             gfx_blend_rect(sx + 4, item_y - 4,
                            sw - 8, STEP_DOT_R * 2 + 10,
-                           RGB(0, 80, 180), 70);
+                           accent, 28);
         }
 
         /* ── Indicador (círculo) ─────────────────────────────────────── */
@@ -902,21 +952,21 @@ static void draw_installer_sidebar(int sx, int sy, int sw, int sh) {
             gfx_wu_line(dot_cx - 1, dot_cy + 3,
                         dot_cx + 5, dot_cy - 4, RGB(255, 255, 255));
         } else if (is_current) {
-            gfx_fill_circle(dot_cx, dot_cy, STEP_DOT_R, SIDEBAR_ACCENT);
-            gfx_circle_outline_aa(dot_cx, dot_cy, STEP_DOT_R, RGB(100, 180, 255));
+            gfx_fill_circle(dot_cx, dot_cy, STEP_DOT_R, accent);
+            gfx_circle_outline_aa(dot_cx, dot_cy, STEP_DOT_R, RGB(140, 185, 240));
             /* Punto interior blanco */
             gfx_fill_circle(dot_cx, dot_cy, 3, RGB(255, 255, 255));
         } else {
             /* Pendiente: sólo contorno */
-            gfx_circle_outline_aa(dot_cx, dot_cy, STEP_DOT_R, SIDEBAR_DIM);
-            gfx_blend_pixel(dot_cx, dot_cy, RGB(60, 80, 120), 120);
+            gfx_circle_outline_aa(dot_cx, dot_cy, STEP_DOT_R, SIDEBAR_MUTED);
+            gfx_blend_pixel(dot_cx, dot_cy, INS_RGB(COLOR_BORDER), 140);
         }
 
         /* ── Conector vertical entre indicadores ─────────────────────── */
         if (i < n_steps - 1) {
             int conn_y0 = dot_cy + STEP_DOT_R + 2;
             int conn_y1 = item_y + step_gap - STEP_DOT_R - 2;
-            unsigned int conn_col = is_done ? SIDEBAR_DONE : SIDEBAR_DIM;
+            unsigned int conn_col = is_done ? SIDEBAR_DONE : SIDEBAR_MUTED;
             for (int yy = conn_y0; yy < conn_y1; yy++)
                 gfx_blend_pixel(dot_cx, yy, conn_col, is_done ? 180 : 80);
         }
@@ -924,8 +974,8 @@ static void draw_installer_sidebar(int sx, int sy, int sw, int sh) {
         /* ── Etiqueta de texto ───────────────────────────────────────── */
         {
             unsigned int tcol = is_done    ? SIDEBAR_DONE  :
-                                is_current ? RGB(220, 235, 255) :
-                                             SIDEBAR_DIM;
+                                is_current ? accent :
+                                             SIDEBAR_MUTED;
             int text_x = dot_cx + STEP_DOT_R + 8;
             int text_y = item_y + STEP_DOT_R - FONT_AA_GLYPH_H / 2;
             gfx_aa_text(text_x, text_y, step_labels[i], tcol, 1);
@@ -934,9 +984,7 @@ static void draw_installer_sidebar(int sx, int sy, int sw, int sh) {
         item_y += step_gap;
     }
 
-    /* ── Borde derecho de separación ─────────────────────────────────── */
-    for (int yy = sy; yy < sy + sh; yy++)
-        gfx_blend_pixel(sx + sw - 1, yy, RGB(60, 90, 160), 100);
+    gfx_blend_rect(sx + sw - 2, sy, 2, sh, INS_RGB(COLOR_BORDER), 40);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -946,15 +994,19 @@ void draw_installer_content(const Window* win) {
     int cx, cy, cw, ch;
     static InstallerState last_step = WELCOME;
 
-    if (!win || !win->is_visible) return;
+    if (!win || !win->is_visible)
+        return;
+    installer_draw_floating_shell(win);
     installer_client_rect(win, &cx, &cy, &cw, &ch);
-    if (cw < 80 || ch < 60) return;
+    if (cw < 80 || ch < 60)
+        return;
 
     /* ── Resetear lista de widgets cada frame ────────────────────────── */
     ui_element_count = 0;
     if (current_step != last_step) {
         __builtin_memset(ui_elements, 0, sizeof(ui_elements));
         focused_element_index = 0;
+        ui_focus_reset_step();
         last_step             = current_step;
     }
     if (current_step != INSTALLING) {
@@ -971,71 +1023,47 @@ void draw_installer_content(const Window* win) {
     if (sidebar_w > 0)
         draw_installer_sidebar(cx, cy, sidebar_w, ch);
 
-    /* ── 2. Tarjeta de contenido principal ───────────────────────────── */
+    /* ── 2. Contenido: sin tarjeta anidada; el panel ya es la superficie única ─ */
     {
-        int card_x  = cx + sidebar_w + 6;
-        int card_y  = cy + 6;
-        int card_w  = cw - sidebar_w - 12;
-        int card_h  = ch - 12;
+        const int gap_side = 14;
+        int       inner_x  = cx + sidebar_w + (sidebar_w > 0 ? gap_side : 12);
+        int       inner_y  = cy + 10;
+        int       inner_w  = cw - sidebar_w - (sidebar_w > 0 ? gap_side + 10 : 20);
+        int       inner_h  = ch - 20;
 
-        if (card_w < 80 || card_h < 60)
+        if (inner_w < 80 || inner_h < 60)
             goto draw_content_fallback;
 
-        /* Sombra difusa detrás de la tarjeta. */
-        gfx_drop_shadow_soft(card_x, card_y, card_w, card_h, CARD_RADIUS, CARD_SHADOW);
+        if (sidebar_w > 0)
+            gfx_blend_rect(cx + sidebar_w + 4, cy + 6, 2, ch - 12,
+                           INS_RGB(COLOR_BORDER), 35);
 
-        /* Superficie de la tarjeta: blanco puro con esquinas AA. */
-        gfx_fill_rounded_rect_aa(card_x, card_y, card_w, card_h,
-                                  CARD_RADIUS, RGB(252, 253, 255));
-
-        /* Franja de encabezado superior con degradado sutil. */
-        {
-            int hdr_h = 40;
-            for (int yy = 0; yy < hdr_h; yy++) {
-                /* De blanco casi puro a blanco con tinte frío leve. */
-                uint32_t col = gfx_lerp_rgb(RGB(245, 247, 255),
-                                             RGB(252, 253, 255), yy, hdr_h);
-                gfx_hline(card_x + CARD_RADIUS, card_y + yy,
-                          card_w - 2 * CARD_RADIUS, col);
-            }
-            /* Reflejar el degradado en las esquinas superiores redondeadas. */
-            for (int yy = 0; yy < CARD_RADIUS && yy < hdr_h; yy++) {
-                uint32_t col = gfx_lerp_rgb(RGB(245, 247, 255),
-                                             RGB(252, 253, 255), yy, hdr_h);
-                for (int xx = 0; xx < CARD_RADIUS; xx++) {
-                    int cdx = CARD_RADIUS - 1 - xx;
-                    int cdy = CARD_RADIUS - 1 - yy;
-                    if (cdx * cdx + cdy * cdy <= CARD_RADIUS * CARD_RADIUS)
-                        gfx_put_pixel(card_x + xx,            card_y + yy, col);
-                    if (cdx * cdx + cdy * cdy <= CARD_RADIUS * CARD_RADIUS)
-                        gfx_put_pixel(card_x + card_w - 1 - xx, card_y + yy, col);
-                }
-            }
-        }
-
-        /* Borde sutil alrededor de la tarjeta (1 px, gris muy claro). */
-        gfx_rounded_rect_stroke_aa(card_x, card_y, card_w, card_h,
-                                    CARD_RADIUS, RGB(215, 218, 230));
-
-        /* Área interior utilizable por el contenido del paso. */
-        int inner_x = card_x + 4;
-        int inner_y = card_y + 4;
-        int inner_w = card_w - 8;
-        int inner_h = card_h - 8;
-
-        /* ── 3. Contenido del paso actual ────────────────────────────── */
         switch (current_step) {
-        case WELCOME:       draw_welcome         (inner_x, inner_y, inner_w, inner_h); break;
-        case LOCALE:        draw_locale_step     (inner_x, inner_y, inner_w, inner_h); break;
-        case USER_ACCOUNT:  draw_user_account_step(inner_x, inner_y, inner_w, inner_h); break;
-        case DISK_SETUP:    draw_disk_setup      (inner_x, inner_y, inner_w, inner_h); break;
-        case SUMMARY:       draw_summary_step    (inner_x, inner_y, inner_w, inner_h);
+        case WELCOME:
+            draw_welcome(inner_x, inner_y, inner_w, inner_h);
+            break;
+        case LOCALE:
+            draw_locale_step(inner_x, inner_y, inner_w, inner_h);
+            break;
+        case USER_ACCOUNT:
+            draw_user_account_step(inner_x, inner_y, inner_w, inner_h);
+            break;
+        case DISK_SETUP:
+            draw_disk_setup(inner_x, inner_y, inner_w, inner_h);
+            break;
+        case SUMMARY:
+            draw_summary_step(inner_x, inner_y, inner_w, inner_h);
             if (ins_show_warn_modal)
                 draw_destructive_modal(inner_x, inner_y, inner_w, inner_h);
             break;
-        case INSTALLING:    draw_installing      (inner_x, inner_y, inner_w, inner_h); break;
-        case FINISHED:      draw_finished        (inner_x, inner_y, inner_w, inner_h); break;
-        default: break;
+        case INSTALLING:
+            draw_installing(inner_x, inner_y, inner_w, inner_h);
+            break;
+        case FINISHED:
+            draw_finished(inner_x, inner_y, inner_w, inner_h);
+            break;
+        default:
+            break;
         }
 
         goto after_content;
@@ -1062,5 +1090,9 @@ after_content:
      * Dibujar todos los widgets no-BUTTON (TEXT_INPUT, CHECKBOX, PROGRESS_BAR).
      * Se hace DESPUÉS del switch para que aparezcan encima del fondo del paso.
      */
+    ui_manager_sync_from_elements();
     ui_draw_all_elements();
+    ui_focus_chain_rebuild();
+    ui_manager_sync_focus_flags();
+    ui_manager_draw_focus_rings();
 }

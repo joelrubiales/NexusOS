@@ -41,12 +41,14 @@ CFLAGS := -m64 \
 LIBGCC   := $(shell $(CC) $(CFLAGS) -print-libgcc-file-name)
 LDFLAGS  := -m elf_x86_64 -T linker.ld -nostdlib -static
 
-COBJS := kernel.o idt.o pit.o keyboard.o pantalla.o teclado.o pci.o nic.o vga.o gfx.o gui.o font8x8.o \
+COBJS := kernel.o idt.o pit.o keyboard.o pantalla.o teclado.o pci.o hda.o xhci.o nic.o e1000.o net.o vga.o gfx.o compositor.o gui.o font8x8.o \
+	syscalls.o nexus_userland.o ext2.o shm.o ipc.o \
 	mouse.o memory.o paging.o kmalloc.o disk.o multitasking.o scheduler.o shell.o gui_installer.o vesa.o window.o desktop.o installer_ui.o mouse_gui.o \
-	apps.o top_panel.o dock_icons.o icons_data.o vfs.o tar.o event_system.o font_aa.o
+	apps.o top_panel.o dock_icons.o icons_data.o vfs.o tar.o event_queue.o event_system.o ui_manager.o font_aa.o elf_loader.o smp.o
 SOBJ  := boot.o
-AOBJS := isr.o task_switch.o sched_switch.o
-OBJS  := $(SOBJ) $(COBJS) font_aa_data.o $(AOBJS)
+AOBJS := isr.o task_switch.o sched_switch.o user_jump.o syscall_entry.o
+TRAMP_BIN_O := smp_trampoline_bin.o
+OBJS  := $(SOBJ) $(COBJS) font_aa_data.o $(AOBJS) $(TRAMP_BIN_O)
 
 .PHONY: all clean dist clean-dist
 
@@ -78,16 +80,57 @@ BOOT_GRUB_CFG := boot/grub/grub.cfg
 $(ISO_DIR)/boot/grub/grub.cfg: $(BOOT_GRUB_CFG) | $(ISO_DIR)/boot/grub
 	cp -f $(BOOT_GRUB_CFG) $@
 
+# Userland (PIE) — ELF en /bin del initrd.
+USER_PKG  := userland
+USER_LD   := $(LD)
+USER_ULIB := $(LIBGCC)
+USER_ELFS := $(USER_PKG)/init.elf $(USER_PKG)/dock.elf $(USER_PKG)/installer.elf
+
+$(USER_PKG)/init.elf: $(USER_PKG)/init.c $(USER_PKG)/nexus_ulib.h $(USER_PKG)/user.ld
+	$(CC) -m64 -ffreestanding -fno-builtin -nostdlib -fno-stack-protector -fpie -O2 \
+		-I$(USER_PKG) -I. -c $(USER_PKG)/init.c -o $(USER_PKG)/init.o
+	$(USER_LD) -m elf_x86_64 -T $(USER_PKG)/user.ld -nostdlib -o $@ $(USER_PKG)/init.o $(USER_ULIB)
+
+$(USER_PKG)/dock.elf: $(USER_PKG)/dock.c $(USER_PKG)/nexus_ulib.h $(USER_PKG)/user.ld
+	$(CC) -m64 -ffreestanding -fno-builtin -nostdlib -fno-stack-protector -fpie -O2 \
+		-I$(USER_PKG) -I. -c $(USER_PKG)/dock.c -o $(USER_PKG)/dock.o
+	$(USER_LD) -m elf_x86_64 -T $(USER_PKG)/user.ld -nostdlib -o $@ $(USER_PKG)/dock.o $(USER_ULIB)
+
+$(USER_PKG)/installer.elf: $(USER_PKG)/installer.c $(USER_PKG)/nexus_ulib.h $(USER_PKG)/user.ld
+	$(CC) -m64 -ffreestanding -fno-builtin -nostdlib -fno-stack-protector -fpie -O2 \
+		-I$(USER_PKG) -I. -c $(USER_PKG)/installer.c -o $(USER_PKG)/installer.o
+	$(USER_LD) -m elf_x86_64 -T $(USER_PKG)/user.ld -nostdlib -o $@ $(USER_PKG)/installer.o $(USER_ULIB)
+
 # Initrd: genera los assets BMP y los empaqueta en un USTAR TAR.
 INITRD := $(ISO_DIR)/boot/initrd.tar
-$(INITRD): gen_initrd.py | $(ISO_DIR)/boot/grub
+$(INITRD): gen_initrd.py $(USER_ELFS) | $(ISO_DIR)/boot/grub
 	python3 gen_initrd.py $@
 
 boot.o: boot.S multiboot2_asm.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(COBJS): %.o: %.c
+smp_trampoline.o: smp_trampoline.asm
+	$(NASM) -f elf64 $< -o $@
+
+smp_trampoline.elf: smp_trampoline.o smp_trampoline.ld
+	$(LD) -m elf_x86_64 -T smp_trampoline.ld -o $@ smp_trampoline.o
+
+smp_trampoline.bin: smp_trampoline.elf
+	objcopy -O binary $< $@
+
+$(TRAMP_BIN_O): smp_trampoline.bin
+	$(LD) -m elf_x86_64 -r -b binary -o $@ $<
+
+# gfx.c: intrínsecos SSE4.1 (-nostdinc: headers del propio GCC vía -isystem …/include).
+GCC_INTRIN_INC := $(shell $(CC) $(CFLAGS) -print-file-name=include)
+GFX_CFLAGS := $(filter-out -mgeneral-regs-only,$(CFLAGS)) -msse2 -msse3 -mssse3 -msse4.1 \
+	-isystem $(GCC_INTRIN_INC)
+
+$(filter-out gfx.o,$(COBJS)): %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
+
+gfx.o: gfx.c font_aa_data.h
+	$(CC) $(GFX_CFLAGS) -c $< -o $@
 
 $(AOBJS): %.o: %.asm
 	$(NASM) -f elf64 $< -o $@
@@ -103,9 +146,11 @@ $(ISO_IMAGE): $(KERNEL_BIN) $(ISO_DIR)/boot/grub/grub.cfg $(INITRD)
 
 clean:
 	rm -f $(OBJS) $(KERNEL_ELF) $(ISO_IMAGE)
+	rm -f $(USER_PKG)/*.o $(USER_ELFS)
 	rm -rf $(ISO_DIR)
 	rm -f kernel.bin
 	rm -f font_aa_data.c font_aa_data.h
+	rm -f smp_trampoline.o smp_trampoline.elf smp_trampoline.bin $(TRAMP_BIN_O)
 
 clean-dist:
 	rm -rf $(DIST_DIR)

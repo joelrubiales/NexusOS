@@ -4,17 +4,13 @@
 #include <stdint.h>
 
 /*
- * Sistema de Eventos de NexusOS — desacopla drivers de la GUI.
+ * Sistema de Eventos de NexusOS — capa de mensajes para la GUI.
  *
- * Arquitectura SPSC (Single-Producer / Single-Consumer):
- *   Productores : ISRs de teclado (IRQ1) y ratón (IRQ12) → push_event().
- *   Consumidor  : Bucle principal de la GUI → pop_event().
+ * Los drivers escriben en el ring hardware (event_queue.h: os_event_t).
+ * pop_event() traduce y devuelve Event; push_event() es solo para eventos
+ * generados por software en el ring secundario.
  *
- * Seguridad en un núcleo sin SMP:
- *   Las ISRs corren con IF=0 → push() no es interrumpible.
- *   El bucle principal corre con IF=1 pero solo toca el campo 'head'.
- *   Un barrier de compilador entre la escritura del dato y la actualización
- *   de 'tail' garantiza visibilidad sin necesitar spinlocks.
+ * Consumidor: bucle principal (gui.c, gui_installer.c, keyboard_getchar).
  */
 
 /* ── Tipos de evento ──────────────────────────────────────────────────── */
@@ -51,7 +47,7 @@ typedef struct {
 /* ── API pública ──────────────────────────────────────────────────────── */
 
 /*
- * push_event: llamar desde ISR o sección crítica.
+ * push_event: ring software (no llamar desde ISR de dispositivo).
  * Si el buffer está lleno, descarta el evento (política lossy).
  */
 void push_event(Event e);

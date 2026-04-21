@@ -25,6 +25,14 @@ void  kheap_panic_nomem(const char* msg);
 /* Paginación x86-64 (identidad): flags bajos tipo PTE (p. ej. VMM_PAGE_PRESENT|VMM_PAGE_RW). */
 #define VMM_PAGE_PRESENT (1ULL << 0)
 #define VMM_PAGE_RW      (1ULL << 1)
+#define VMM_PAGE_USER    (1ULL << 2)
+#define VMM_PAGE_PWT     (1ULL << 3) /* Page Write-Through */
+#define VMM_PAGE_PCD     (1ULL << 4) /* Page Cache Disable — típico MMIO “no caché” */
+/* Execute-disable (requiere EFER.NXE en boot.S). */
+#define VMM_PAGE_NX      (1ULL << 63)
+
+/* MMIO dispositivo: RW + PCD (+ NX). Ajustar PAT/MTRR en hardware exigente. */
+#define VMM_PAGE_MMIO    (VMM_PAGE_PRESENT | VMM_PAGE_RW | VMM_PAGE_PCD | VMM_PAGE_NX)
 
 void vmm_map_page(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags);
 void vmm_identity_map_range(uint64_t phys_start, uint64_t len, uint64_t flags);

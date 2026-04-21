@@ -1,5 +1,6 @@
 #include "mouse_gui.h"
 #include "gfx.h"
+#include "compositor.h"
 
 int nwm_hit_titlebar(const NWM_Window* w, int px, int py, int title_h) {
     if (!w->visible) return 0;
@@ -36,10 +37,13 @@ void nwm_raise_window(int* zorder, int zcount, int id) {
 
 void nwm_apply_window_drag(NWM_Window* w, int mx, int my, int min_y, int max_y) {
     int sw = gfx_width();
+    int ox = w->x, oy = w->y;
     w->x = mx - w->drag_ox;
     w->y = my - w->drag_oy;
     if (w->x < 0) w->x = 0;
     if (w->x + w->w > sw) w->x = sw - w->w;
     if (w->y < min_y) w->y = min_y;
     if (w->y + w->h > max_y) w->y = max_y - w->h;
+    if (w->x != ox || w->y != oy)
+        compositor_notify_window_moved(w, ox, oy);
 }

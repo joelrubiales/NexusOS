@@ -74,7 +74,8 @@ void vmm_map_page(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
     uint64_t* pdpt;
     uint64_t* pd;
     uint64_t* pt;
-    uint64_t pte_val = (phys_addr & PTE_ADDR_MASK) | (flags & 0xFFFULL) | PTE_P;
+    uint64_t pte_val =
+        (phys_addr & PTE_ADDR_MASK) | PTE_P | (flags & 0xFFFULL) | (flags & (1ULL << 63));
 
     pdpt_p = vmm_ensure_child(pml4, i4, PTE_P | PTE_RW);
     if (!pdpt_p) return;

@@ -1,5 +1,6 @@
 #include "vfs.h"
 #include "tar.h"
+#include "ext2.h"
 #include "memory.h"
 #include <stddef.h>
 
@@ -82,59 +83,68 @@ static uint32_t tar_octal(const uint8_t* s, int n) {
     return v;
 }
 
-const uint8_t* vfs_find(const char* path, uint32_t* out_size) {
+const uint8_t* vfs_find(const char* path, uint32_t* out_size, int* out_heap_owned) {
     uint32_t off = 0;
     const char* want = canon(path);
 
-    if (!initrd_base || initrd_size < TAR_BLOCK) return NULL;
-    if (out_size) *out_size = 0;
+    if (out_heap_owned)
+        *out_heap_owned = 0;
+    if (out_size)
+        *out_size = 0;
 
-    while (off + TAR_BLOCK <= initrd_size) {
-        const uint8_t* hdr = initrd_base + off;
+    if (initrd_base && initrd_size >= TAR_BLOCK) {
+        while (off + TAR_BLOCK <= initrd_size) {
+            const uint8_t* hdr = initrd_base + off;
 
-        /* Dos bloques de ceros → fin del TAR. */
-        if (hdr[0] == 0) return NULL;
+            /* Dos bloques de ceros → fin del TAR: seguir con Ext2 si aplica. */
+            if (hdr[0] == 0)
+                break;
 
-        /* Tamaño del archivo (offset 124, 12 bytes de octal ASCII). */
-        uint32_t fsize = tar_octal(hdr + 124, 12);
+            /* Tamaño del archivo (offset 124, 12 bytes de octal ASCII). */
+            uint32_t fsize = tar_octal(hdr + 124, 12);
 
-        /* Tipo (offset 156): '0' o '\0' → fichero regular. */
-        uint8_t ftype = hdr[156];
-        int is_file = (ftype == '0' || ftype == '\0');
+            /* Tipo (offset 156): '0' o '\0' → fichero regular. */
+            uint8_t ftype = hdr[156];
+            int is_file = (ftype == '0' || ftype == '\0');
 
-        if (is_file) {
-            /* Nombre (offset 0, 100 bytes) + prefijo ustar (offset 345, 155 bytes).
-             * Para rutas largas, el nombre completo es prefix + '/' + name.
-             * En la mayoría de los casos el prefix está vacío. */
-            char entry[256];
-            int  ei = 0;
-            /* Prefijo (campo offset 345, 155 bytes). */
-            const uint8_t* pfx = hdr + 345;
-            if (pfx[0]) {
-                int pi;
-                for (pi = 0; pi < 155 && pfx[pi]; pi++)
-                    if (ei < 254) entry[ei++] = (char)pfx[pi];
-                if (ei < 254) entry[ei++] = '/';
+            if (is_file) {
+                char entry[256];
+                int  ei = 0;
+                const uint8_t* pfx = hdr + 345;
+                if (pfx[0]) {
+                    int pi;
+                    for (pi = 0; pi < 155 && pfx[pi]; pi++)
+                        if (ei < 254) entry[ei++] = (char)pfx[pi];
+                    if (ei < 254) entry[ei++] = '/';
+                }
+                int ni;
+                for (ni = 0; ni < 100 && hdr[ni]; ni++)
+                    if (ei < 254) entry[ei++] = (char)hdr[ni];
+                entry[ei] = '\0';
+
+                const char* have = canon(entry);
+                if (vfs_strcmp(have, want) == 0) {
+                    const uint8_t* data = hdr + TAR_BLOCK;
+                    if (off + TAR_BLOCK + fsize > initrd_size)
+                        return NULL;
+                    if (out_size)
+                        *out_size = fsize;
+                    return data;
+                }
             }
-            /* Nombre base. */
-            int ni;
-            for (ni = 0; ni < 100 && hdr[ni]; ni++)
-                if (ei < 254) entry[ei++] = (char)hdr[ni];
-            entry[ei] = '\0';
 
-            const char* have = canon(entry);
-            if (vfs_strcmp(have, want) == 0) {
-                const uint8_t* data = hdr + TAR_BLOCK;
-                /* Verificar que el payload cabe en el initrd. */
-                if (off + TAR_BLOCK + fsize > initrd_size) return NULL;
-                if (out_size) *out_size = fsize;
-                return data;
-            }
+            uint32_t data_blocks = (fsize + TAR_BLOCK - 1u) / TAR_BLOCK;
+            off += TAR_BLOCK + data_blocks * TAR_BLOCK;
         }
+    }
 
-        /* Avanzar al siguiente bloque: cabecera + CEIL(fsize/512) bloques. */
-        uint32_t data_blocks = (fsize + TAR_BLOCK - 1u) / TAR_BLOCK;
-        off += TAR_BLOCK + data_blocks * TAR_BLOCK;
+    if (ext2_mounted()) {
+        uint8_t* e = ext2_read_file_kmalloc(path, out_size);
+        if (e) {
+            if (out_heap_owned)
+                *out_heap_owned = 1;
+            return e;
+        }
     }
     return NULL;
 }
@@ -176,6 +186,7 @@ static int32_t le32s(const uint8_t* p) {
 uint32_t* vfs_load_bmp(const char* path, int* out_w, int* out_h) {
     uint32_t   file_size;
     const uint8_t* d;
+    int        heap_file = 0;
     uint32_t   pix_off;
     int32_t    bmp_width, bmp_height_raw;
     int        height, width, bottom_up;
@@ -189,11 +200,13 @@ uint32_t* vfs_load_bmp(const char* path, int* out_w, int* out_h) {
     if (out_w) *out_w = 0;
     if (out_h) *out_h = 0;
 
-    d = vfs_find(path, &file_size);
-    if (!d || file_size < 54u) return NULL;
+    d = vfs_find(path, &file_size, &heap_file);
+    if (!d || file_size < 54u)
+        return NULL;
 
     /* Verificar magia "BM". */
-    if (d[0] != 'B' || d[1] != 'M') return NULL;
+    if (d[0] != 'B' || d[1] != 'M')
+        goto bmp_bad;
 
     pix_off     = le32(d + 10);
     bmp_width   = le32s(d + 18);
@@ -201,11 +214,14 @@ uint32_t* vfs_load_bmp(const char* path, int* out_w, int* out_h) {
     bpp         = le16(d + 28);
     compression = le32(d + 30);
 
-    if (bmp_width  <= 0 || bmp_width  > 4096) return NULL;
+    if (bmp_width  <= 0 || bmp_width  > 4096)
+        goto bmp_bad;
     if (bmp_height_raw == 0 || bmp_height_raw > 4096 || bmp_height_raw < -4096)
-        return NULL;
-    if (bpp != 24 && bpp != 32) return NULL;
-    if (compression != 0u) return NULL;
+        goto bmp_bad;
+    if (bpp != 24 && bpp != 32)
+        goto bmp_bad;
+    if (compression != 0u)
+        goto bmp_bad;
 
     width     = bmp_width;
     bottom_up = (bmp_height_raw > 0);
@@ -215,10 +231,12 @@ uint32_t* vfs_load_bmp(const char* path, int* out_w, int* out_h) {
     /* Cada fila está alineada a 4 bytes en el archivo. */
     row_stride   = ((uint32_t)width * bytes_per_px + 3u) & ~3u;
 
-    if (pix_off + (uint32_t)height * row_stride > file_size) return NULL;
+    if (pix_off + (uint32_t)height * row_stride > file_size)
+        goto bmp_bad;
 
     buf = (uint32_t*)kmalloc((uint64_t)width * (uint64_t)height * 4u);
-    if (!buf) return NULL;
+    if (!buf)
+        goto bmp_bad;
 
     {
         const uint8_t* pixels = d + pix_off;
@@ -244,7 +262,14 @@ uint32_t* vfs_load_bmp(const char* path, int* out_w, int* out_h) {
 
     if (out_w) *out_w = width;
     if (out_h) *out_h = height;
+    if (heap_file && d)
+        kfree((void*)d);
     return buf;
+
+bmp_bad:
+    if (heap_file && d)
+        kfree((void*)d);
+    return NULL;
 }
 
 /* ─── Caché de assets ────────────────────────────────────────────────────── */

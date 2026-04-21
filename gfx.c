@@ -4,6 +4,7 @@
 #include "font8x8.h"
 #include "nexus.h"
 #include "memory.h"
+#include <immintrin.h>
 #include <stdint.h>
 
 _Static_assert(sizeof(VesaBootInfo) == 28, "VesaBootInfo must match boot2 / boot_info.h");
@@ -32,6 +33,16 @@ static int fb_size;
 /* uint32s per scanline (LFB pitch/4 when drawing direct; else scr_w). */
 static int fb_stride = 0;
 static int gfx_direct32 = 0;
+
+#define GFX_CANVAS_STACK 8
+static struct {
+    unsigned int* backbuf;
+    int scr_w, scr_h, scr_pitch, fb_stride;
+    int scr_bpp;
+    int screen_w, screen_h;
+    int gfx_direct32;
+} gfx_canvas_stk[GFX_CANVAS_STACK];
+static int gfx_canvas_depth;
 
 /* RAM backbuffer at 4MB — solo si no dibujamos directo al LFB (p. ej. 24 bpp). */
 #define BACKBUF_ADDR 0x400000
@@ -182,6 +193,53 @@ void gfx_attach_double_buffer(uint32_t* buf) {
     }
 }
 
+void gfx_push_canvas(uint32_t* buf, int w, int h, int stride_u32) {
+    if (gfx_canvas_depth >= GFX_CANVAS_STACK || !buf || w <= 0 || h <= 0 || stride_u32 < w)
+        return;
+    gfx_canvas_stk[gfx_canvas_depth].backbuf = backbuf;
+    gfx_canvas_stk[gfx_canvas_depth].scr_w = scr_w;
+    gfx_canvas_stk[gfx_canvas_depth].scr_h = scr_h;
+    gfx_canvas_stk[gfx_canvas_depth].scr_pitch = scr_pitch;
+    gfx_canvas_stk[gfx_canvas_depth].fb_stride = fb_stride;
+    gfx_canvas_stk[gfx_canvas_depth].scr_bpp = scr_bpp;
+    gfx_canvas_stk[gfx_canvas_depth].screen_w = screen_width;
+    gfx_canvas_stk[gfx_canvas_depth].screen_h = screen_height;
+    gfx_canvas_stk[gfx_canvas_depth].gfx_direct32 = gfx_direct32;
+    gfx_canvas_depth++;
+    backbuf = (unsigned int*)buf;
+    scr_w = w;
+    scr_h = h;
+    fb_stride = stride_u32;
+    scr_pitch = stride_u32 * 4;
+    screen_width = w;
+    screen_height = h;
+    gfx_direct32 = 0;
+    scr_bpp = 32;
+}
+
+void gfx_pop_canvas(void) {
+    if (gfx_canvas_depth <= 0)
+        return;
+    gfx_canvas_depth--;
+    backbuf = gfx_canvas_stk[gfx_canvas_depth].backbuf;
+    scr_w = gfx_canvas_stk[gfx_canvas_depth].scr_w;
+    scr_h = gfx_canvas_stk[gfx_canvas_depth].scr_h;
+    scr_pitch = gfx_canvas_stk[gfx_canvas_depth].scr_pitch;
+    fb_stride = gfx_canvas_stk[gfx_canvas_depth].fb_stride;
+    scr_bpp = gfx_canvas_stk[gfx_canvas_depth].scr_bpp;
+    screen_width = gfx_canvas_stk[gfx_canvas_depth].screen_w;
+    screen_height = gfx_canvas_stk[gfx_canvas_depth].screen_h;
+    gfx_direct32 = gfx_canvas_stk[gfx_canvas_depth].gfx_direct32;
+}
+
+uint32_t* gfx_backbuffer_u32(void) {
+    if (scr_bpp != 32 || !backbuf)
+        return 0;
+    return (uint32_t*)backbuf;
+}
+
+int gfx_backbuffer_stride_u32(void) { return fb_stride; }
+
 void gfx_enable_double_buffer_kmalloc(void) {
     uint64_t sz;
     uint32_t* p;
@@ -190,6 +248,16 @@ void gfx_enable_double_buffer_kmalloc(void) {
     p = (uint32_t*)kmalloc(sz);
     if (!p) kheap_panic_nomem("gfx_enable_double_buffer_kmalloc");
     gfx_attach_double_buffer(p);
+}
+
+/* t / 255 exacto para t ≤ 65025 (productos 8×8 en alpha-over). */
+static inline __m128i gfx_div255_epu32(__m128i t) {
+    __m128i m = _mm_mullo_epi32(t, _mm_set1_epi32(257));
+    return _mm_srli_epi32(_mm_add_epi32(m, _mm_set1_epi32(257)), 16);
+}
+
+static inline unsigned int gfx_div255_u32(unsigned int t) {
+    return (t * 257u + 257u) >> 16u;
 }
 
 /* Copia de fila al LFB: rep movsq (cuadr palabras) + cola byte a byte. */
@@ -217,6 +285,106 @@ static void gfx_copy_row_movsq(volatile unsigned char* d, const unsigned char* s
     }
 }
 
+#define GFX_MAX_PRESENT_RECTS 48
+
+static struct {
+    int x, y, w, h;
+} gfx_present_r[GFX_MAX_PRESENT_RECTS];
+static int  gfx_present_n;
+static int  gfx_present_need_full;
+static int  gfx_present_noop;
+
+void gfx_mark_present_full(void) {
+    gfx_present_need_full = 1;
+    gfx_present_noop      = 0;
+    gfx_present_n         = 0;
+}
+
+void gfx_mark_present_noop(void) {
+    gfx_present_noop      = 1;
+    gfx_present_need_full = 0;
+    gfx_present_n         = 0;
+}
+
+void gfx_mark_present_rect(int x, int y, int w, int h) {
+    int i;
+
+    if (gfx_present_need_full || gfx_present_noop)
+        return;
+
+    if (w <= 0 || h <= 0 || !backbuf || scr_w <= 0 || scr_h <= 0)
+        return;
+
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (x + w > scr_w)
+        w = scr_w - x;
+    if (y + h > scr_h)
+        h = scr_h - y;
+    if (w <= 0 || h <= 0)
+        return;
+
+    if (gfx_present_n >= GFX_MAX_PRESENT_RECTS) {
+        gfx_mark_present_full();
+        return;
+    }
+
+    for (i = 0; i < gfx_present_n; i++) {
+        if (gfx_present_r[i].x == x && gfx_present_r[i].y == y && gfx_present_r[i].w == w &&
+            gfx_present_r[i].h == h)
+            return;
+    }
+
+    gfx_present_r[gfx_present_n].x = x;
+    gfx_present_r[gfx_present_n].y = y;
+    gfx_present_r[gfx_present_n].w = w;
+    gfx_present_r[gfx_present_n].h = h;
+    gfx_present_n++;
+}
+
+void memcpy_fast(void* dst, const void* src, size_t n) {
+    unsigned char* d = (unsigned char*)dst;
+    const unsigned char* s = (const unsigned char*)src;
+    while (n >= 64) {
+        __m128i q0 = _mm_loadu_si128((const __m128i*)(void const*)s);
+        __m128i q1 = _mm_loadu_si128((const __m128i*)(void const*)(s + 16));
+        __m128i q2 = _mm_loadu_si128((const __m128i*)(void const*)(s + 32));
+        __m128i q3 = _mm_loadu_si128((const __m128i*)(void const*)(s + 48));
+        _mm_storeu_si128((__m128i*)(void*)d, q0);
+        _mm_storeu_si128((__m128i*)(void*)(d + 16), q1);
+        _mm_storeu_si128((__m128i*)(void*)(d + 32), q2);
+        _mm_storeu_si128((__m128i*)(void*)(d + 48), q3);
+        s += 64;
+        d += 64;
+        n -= 64;
+    }
+    if (n)
+        gfx_copy_row_movsq((volatile unsigned char*)d, s, n);
+}
+
+static void gfx_blit_rect_to_lfb_32(int x, int y, int w, int h) {
+    size_t                    row_b = (size_t)(unsigned)scr_pitch;
+    uint32_t*                 src0  = (uint32_t*)backbuf;
+    volatile unsigned char*   dst0  = lfb;
+    int                       j;
+    unsigned                  stride_u32 = (unsigned)fb_stride;
+
+    for (j = 0; j < h; j++) {
+        const unsigned char* src =
+            (const unsigned char*)(src0 + (size_t)(unsigned)(y + j) * (size_t)stride_u32 +
+                                   (size_t)(unsigned)x);
+        volatile unsigned char* dst =
+            dst0 + (size_t)(unsigned)(y + j) * row_b + (size_t)(unsigned)x * 4u;
+        memcpy_fast((void*)dst, src, (size_t)(unsigned)w * 4u);
+    }
+}
+
 void gfx_swap_buffers(void) {
     if (!backbuf || !lfb) return;
 
@@ -227,12 +395,29 @@ void gfx_swap_buffers(void) {
     }
 
     if (scr_bpp == 32) {
-        size_t y;
-        size_t row_b = (size_t)(unsigned)scr_pitch;
-        const unsigned char* src0 = (const unsigned char*)backbuf;
-        volatile unsigned char* dst0 = (volatile unsigned char*)lfb;
-        for (y = 0; y < (size_t)(unsigned)scr_h; y++)
-            gfx_copy_row_movsq(dst0 + y * row_b, src0 + y * row_b, row_b);
+        if (gfx_present_noop) {
+            gfx_present_noop = 0;
+            __asm__ volatile("mfence" ::: "memory");
+            vesa_force_refresh();
+            return;
+        }
+
+        if (!gfx_present_need_full && gfx_present_n > 0) {
+            int i;
+            for (i = 0; i < gfx_present_n; i++)
+                gfx_blit_rect_to_lfb_32(gfx_present_r[i].x, gfx_present_r[i].y, gfx_present_r[i].w,
+                                        gfx_present_r[i].h);
+            gfx_present_n = 0;
+        } else {
+            size_t y;
+            size_t row_b = (size_t)(unsigned)scr_pitch;
+            const unsigned char* src0 = (const unsigned char*)backbuf;
+            volatile unsigned char* dst0 = (volatile unsigned char*)lfb;
+            gfx_present_need_full = 0;
+            gfx_present_n         = 0;
+            for (y = 0; y < (size_t)(unsigned)scr_h; y++)
+                memcpy_fast((void*)(dst0 + y * row_b), src0 + y * row_b, row_b);
+        }
     } else if (scr_bpp == 24) {
         int y;
         for (y = 0; y < scr_h; y++) {
@@ -246,7 +431,13 @@ void gfx_swap_buffers(void) {
                 row[x * 3 + 2] = (unsigned char)(c >> 16);
             }
         }
+    } else {
+        /* bpp no soportado para parcial */
     }
+
+    gfx_present_noop      = 0;
+    gfx_present_need_full = 0;
+    gfx_present_n         = 0;
     __asm__ volatile("mfence" ::: "memory");
     vesa_force_refresh();
 }
@@ -293,9 +484,9 @@ uint32_t blend_colors(uint32_t fg, uint32_t bg) {
     unsigned int fr = (fg >> 16) & 0xFFu,  fg2 = (fg >> 8) & 0xFFu,  fb = fg & 0xFFu;
     unsigned int br = (bg >> 16) & 0xFFu,  bg2 = (bg >> 8) & 0xFFu,  bb = bg & 0xFFu;
     unsigned int inv = 255u - a;
-    return (((fr * a + br * inv) / 255u) << 16u)
-         | (((fg2 * a + bg2 * inv) / 255u) << 8u)
-         |  ((fb  * a + bb  * inv) / 255u);
+    return ((gfx_div255_u32(fr * a + br * inv) << 16u)
+          | (gfx_div255_u32(fg2 * a + bg2 * inv) << 8u)
+          |   gfx_div255_u32(fb  * a + bb  * inv));
 }
 
 /*
@@ -558,13 +749,20 @@ unsigned int gfx_get_pixel(int x, int y) {
 }
 
 void gfx_blend_pixel(int x, int y, unsigned int fg, unsigned int alpha) {
-    unsigned int dst, r, g, b, frr, fgg, fbb, dr, dg, db;
+    unsigned int dst, frr, fgg, fbb, dr, dg, db, inv;
     if ((unsigned)x >= (unsigned)scr_w || (unsigned)y >= (unsigned)scr_h || !backbuf || alpha == 0)
         return;
     if (alpha >= 255) {
-        gfx_put_pixel(x, y, fg);
+        fg &= 0x00FFFFFFu;
+        if (scr_bpp == 32) {
+            uint32_t* dbp = (uint32_t*)backbuf;
+            size_t sp = (size_t)(unsigned)(scr_pitch / 4);
+            dbp[(size_t)(unsigned)y * sp + (size_t)(unsigned)x] = (uint32_t)fg;
+        } else
+            backbuf[y * fb_stride + x] = fg;
         return;
     }
+    inv = 255u - alpha;
     dst = gfx_get_pixel(x, y);
     frr = (fg >> 16) & 0xFF;
     fgg = (fg >> 8) & 0xFF;
@@ -572,10 +770,19 @@ void gfx_blend_pixel(int x, int y, unsigned int fg, unsigned int alpha) {
     dr = (dst >> 16) & 0xFF;
     dg = (dst >> 8) & 0xFF;
     db = dst & 0xFF;
-    r = (frr * alpha + dr * (255 - alpha)) / 255;
-    g = (fgg * alpha + dg * (255 - alpha)) / 255;
-    b = (fbb * alpha + db * (255 - alpha)) / 255;
-    gfx_put_pixel(x, y, ((unsigned)r << 16) | ((unsigned)g << 8) | (unsigned)b);
+    if (scr_bpp == 32) {
+        uint32_t* dbp = (uint32_t*)backbuf;
+        size_t sp = (size_t)(unsigned)(scr_pitch / 4);
+        uint32_t out = (gfx_div255_u32(frr * alpha + dr * inv) << 16)
+                     | (gfx_div255_u32(fgg * alpha + dg * inv) << 8)
+                     |  gfx_div255_u32(fbb * alpha + db * inv);
+        dbp[(size_t)(unsigned)y * sp + (size_t)(unsigned)x] = out;
+    } else {
+        unsigned int r = gfx_div255_u32(frr * alpha + dr * inv);
+        unsigned int g = gfx_div255_u32(fgg * alpha + dg * inv);
+        unsigned int b = gfx_div255_u32(fbb * alpha + db * inv);
+        backbuf[y * fb_stride + x] = (r << 16) | (g << 8) | b;
+    }
 }
 
 void gfx_fill_circle(int cx, int cy, int r, unsigned int color) {
@@ -645,12 +852,60 @@ static int font_bit(const unsigned char* gl, int col, int row) {
     return (gl[row] >> col) & 1;
 }
 
+static void gfx_blend_rect_row_u32(uint32_t* row, int x0, int x1, uint32_t fg, unsigned int alpha) {
+    unsigned int fr = (fg >> 16) & 255u, fgc = (fg >> 8) & 255u, fb = fg & 255u;
+    __m128i inv = _mm_set1_epi32((int)(255u - alpha));
+    __m128i al  = _mm_set1_epi32((int)alpha);
+    __m128i frv = _mm_set1_epi32((int)fr);
+    __m128i fgv = _mm_set1_epi32((int)fgc);
+    __m128i fbv = _mm_set1_epi32((int)fb);
+    __m128i maskff = _mm_set1_epi32(0xFF);
+    int x = x0;
+    for (; x + 4 <= x1; x += 4) {
+        __m128i d = _mm_loadu_si128((__m128i*)(row + x));
+        __m128i db = _mm_and_si128(d, maskff);
+        __m128i dg = _mm_and_si128(_mm_srli_epi32(d, 8), maskff);
+        __m128i dr = _mm_and_si128(_mm_srli_epi32(d, 16), maskff);
+        __m128i ob = gfx_div255_epu32(_mm_add_epi32(_mm_mullo_epi32(fbv, al), _mm_mullo_epi32(db, inv)));
+        __m128i og = gfx_div255_epu32(_mm_add_epi32(_mm_mullo_epi32(fgv, al), _mm_mullo_epi32(dg, inv)));
+        __m128i oR = gfx_div255_epu32(_mm_add_epi32(_mm_mullo_epi32(frv, al), _mm_mullo_epi32(dr, inv)));
+        __m128i o = _mm_or_si128(_mm_or_si128(ob, _mm_slli_epi32(og, 8)), _mm_slli_epi32(oR, 16));
+        _mm_storeu_si128((__m128i*)(row + x), o);
+    }
+    for (; x < x1; x++) {
+        unsigned int dst = row[x];
+        unsigned int dr = (dst >> 16) & 255u, dg = (dst >> 8) & 255u, dbb = dst & 255u;
+        row[x] = (gfx_div255_u32(fr * alpha + dr * (255u - alpha)) << 16)
+               | (gfx_div255_u32(fgc * alpha + dg * (255u - alpha)) << 8)
+               |  gfx_div255_u32(fb * alpha + dbb * (255u - alpha));
+    }
+}
+
 void gfx_blend_rect(int x, int y, int w, int h, unsigned int fg, unsigned int alpha) {
-    int j, i;
-    if (alpha == 0) return;
-    for (j = 0; j < h; j++) {
-        for (i = 0; i < w; i++)
-            gfx_blend_pixel(x + i, y + j, fg, alpha);
+    int x0, y0, x1, y1, j;
+    if (alpha == 0 || !backbuf || w <= 0 || h <= 0) return;
+    if (alpha >= 255u) {
+        gfx_fill_rect(x, y, w, h, fg);
+        return;
+    }
+    x0 = x < 0 ? 0 : x;
+    y0 = y < 0 ? 0 : y;
+    x1 = x + w > scr_w ? scr_w : x + w;
+    y1 = y + h > scr_h ? scr_h : y + h;
+    if (x0 >= x1 || y0 >= y1) return;
+    if (scr_bpp == 32) {
+        size_t sp = (size_t)(unsigned)(scr_pitch / 4);
+        uint32_t* base = (uint32_t*)backbuf;
+        for (j = y0; j < y1; j++) {
+            uint32_t* row = base + (size_t)(unsigned)j * sp;
+            gfx_blend_rect_row_u32(row, x0, x1, (uint32_t)fg, alpha);
+        }
+    } else {
+        for (j = y0; j < y1; j++) {
+            int i;
+            for (i = x0; i < x1; i++)
+                gfx_blend_pixel(i, j, fg, alpha);
+        }
     }
 }
 
@@ -844,33 +1099,84 @@ void gfx_rounded_rect_stroke_aa(int x, int y, int w, int h, int corner_r, unsign
     }
 }
 
+static void gfx_blend_rgba_store4(uint32_t* d, __m128i s, __m128i d_v) {
+    __m128i zero = _mm_setzero_si128();
+    __m128i maskff = _mm_set1_epi32(0xFF);
+    __m128i sa = _mm_srli_epi32(s, 24);
+    __m128i inv = _mm_sub_epi32(_mm_set1_epi32(255), sa);
+    __m128i sb = _mm_and_si128(s, maskff);
+    __m128i sg = _mm_and_si128(_mm_srli_epi32(s, 8), maskff);
+    __m128i sr = _mm_and_si128(_mm_srli_epi32(s, 16), maskff);
+    __m128i db = _mm_and_si128(d_v, maskff);
+    __m128i dg = _mm_and_si128(_mm_srli_epi32(d_v, 8), maskff);
+    __m128i dr = _mm_and_si128(_mm_srli_epi32(d_v, 16), maskff);
+    __m128i ob = gfx_div255_epu32(_mm_add_epi32(_mm_mullo_epi32(sb, sa), _mm_mullo_epi32(db, inv)));
+    __m128i og = gfx_div255_epu32(_mm_add_epi32(_mm_mullo_epi32(sg, sa), _mm_mullo_epi32(dg, inv)));
+    __m128i oR = gfx_div255_epu32(_mm_add_epi32(_mm_mullo_epi32(sr, sa), _mm_mullo_epi32(dr, inv)));
+    __m128i blended = _mm_or_si128(_mm_or_si128(ob, _mm_slli_epi32(og, 8)), _mm_slli_epi32(oR, 16));
+    __m128i m0 = _mm_cmpeq_epi32(sa, zero);
+    __m128i opq = _mm_and_si128(s, _mm_set1_epi32(0x00FFFFFF));
+    __m128i out = _mm_blendv_epi8(blended, d_v, m0);
+    __m128i m255 = _mm_cmpeq_epi32(sa, _mm_set1_epi32(255));
+    out = _mm_blendv_epi8(out, opq, m255);
+    _mm_storeu_si128((__m128i*)d, out);
+}
+
 void gfx_draw_image_rgba(int x, int y, int w, int h, const unsigned int* argb) {
-    int ix, iy;
-    unsigned int px;
-    unsigned char a, rr, gg, bb;
-    unsigned int dst, dr, dg, db, nr, ng, nb;
+    int iy, ix0, ix1, stride_u32, ix;
     if (!backbuf || w <= 0 || h <= 0) return;
+    ix0 = 0;
+    ix1 = w;
+    if (x < 0) ix0 = -x;
+    if (x + w > scr_w) ix1 = scr_w - x;
+    if (ix0 >= ix1) return;
+    stride_u32 = (scr_bpp == 32) ? (scr_pitch / 4) : fb_stride;
+
     for (iy = 0; iy < h; iy++) {
-        for (ix = 0; ix < w; ix++) {
-            px = argb[iy * w + ix];
-            a = (unsigned char)(px >> 24);
-            if (a == 0) continue;
-            rr = (unsigned char)(px >> 16);
-            gg = (unsigned char)(px >> 8);
-            bb = (unsigned char)px;
-            if ((unsigned)(x + ix) >= (unsigned)scr_w || (unsigned)(y + iy) >= (unsigned)scr_h) continue;
-            if (a >= 255) {
-                gfx_put_pixel(x + ix, y + iy, (unsigned int)rr << 16 | (unsigned int)gg << 8 | bb);
-                continue;
+        int ay = y + iy;
+        if ((unsigned)ay >= (unsigned)scr_h) continue;
+        const uint32_t* srow = (const uint32_t*)argb + (size_t)(unsigned)iy * (size_t)(unsigned)w;
+
+        if (scr_bpp != 32) {
+            for (ix = ix0; ix < ix1; ix++) {
+                int ax = x + ix;
+                uint32_t px = srow[ix];
+                unsigned a = (unsigned)(px >> 24);
+                if (a == 0) continue;
+                if ((unsigned)ax >= (unsigned)scr_w) continue;
+                if (a >= 255)
+                    backbuf[(size_t)(unsigned)ay * (size_t)(unsigned)fb_stride + (size_t)(unsigned)ax] =
+                        px & 0x00FFFFFFu;
+                else {
+                    unsigned dst = backbuf[(size_t)(unsigned)ay * (size_t)(unsigned)fb_stride + (size_t)(unsigned)ax];
+                    backbuf[(size_t)(unsigned)ay * (size_t)(unsigned)fb_stride + (size_t)(unsigned)ax] =
+                        blend_colors(px, dst);
+                }
             }
-            dst = gfx_get_pixel(x + ix, y + iy);
-            dr = (dst >> 16) & 0xFF;
-            dg = (dst >> 8) & 0xFF;
-            db = dst & 0xFF;
-            nr = (rr * a + dr * (255 - a)) / 255;
-            ng = (gg * a + dg * (255 - a)) / 255;
-            nb = (bb * a + db * (255 - a)) / 255;
-            gfx_put_pixel(x + ix, y + iy, ((unsigned)nr << 16) | ((unsigned)ng << 8) | (unsigned)nb);
+            continue;
+        }
+
+        {
+            uint32_t* drow = (uint32_t*)backbuf + (size_t)(unsigned)ay * (size_t)(unsigned)stride_u32;
+            for (ix = ix0; ix < ix1; ) {
+                if (ix + 4 <= ix1) {
+                    __m128i s4 = _mm_loadu_si128((const __m128i*)(void const*)(srow + ix));
+                    __m128i d4 = _mm_loadu_si128((__m128i*)(void*)(drow + x + ix));
+                    gfx_blend_rgba_store4(drow + x + ix, s4, d4);
+                    ix += 4;
+                } else {
+                    uint32_t px = srow[ix];
+                    unsigned a = (unsigned)(px >> 24) & 255u;
+                    if (a) {
+                        if (a >= 255)
+                            drow[(size_t)(unsigned)x + (size_t)(unsigned)ix] = px & 0x00FFFFFFu;
+                        else
+                            drow[(size_t)(unsigned)x + (size_t)(unsigned)ix] =
+                                blend_colors(px, drow[(size_t)(unsigned)x + (size_t)(unsigned)ix]);
+                    }
+                    ix++;
+                }
+            }
         }
     }
 }

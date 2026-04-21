@@ -1,6 +1,7 @@
 #ifndef GFX_H
 #define GFX_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "boot_info.h"
 
@@ -114,7 +115,21 @@ void gfx_rect_mica(int x, int y, int w, int h, int corner_r, unsigned int tint, 
 /* Mouse cursor */
 void gfx_draw_cursor(int cx, int cy);
 
-/* Volcado rápido double_buffer → LFB (copia por filas en bloques de 64 bits). */
+/* Copia RAM→RAM o RAM→MMIO: bloques de 64 B vía SSE2, cola con rep movsq. */
+void memcpy_fast(void* dst, const void* src, size_t n);
+
+/*
+ * Presentación al LFB (tras compositor_render):
+ *   - gfx_mark_present_full()     → copia todo el backbuffer.
+ *   - gfx_mark_present_rect*      → solo rectángulos (memcpy_fast por fila).
+ *   - gfx_mark_present_noop()     → nada que copiar (frame idle).
+ * Si swap_buffers() se llama sin marcas, se asume volcado completo (compat).
+ */
+void gfx_mark_present_full(void);
+void gfx_mark_present_noop(void);
+void gfx_mark_present_rect(int x, int y, int w, int h);
+
+/* Volcado double_buffer → LFB según marcas del frame; sin marcas = copia completa. */
 void gfx_swap_buffers(void);
 
 /* Alias histórico — llama a gfx_swap_buffers. */
@@ -122,6 +137,14 @@ void gfx_present(void);
 
 /* Enlaza un búfer RAM ya reservado (p. ej. kmalloc(pitch*height)); present copia al LFB. */
 void gfx_attach_double_buffer(uint32_t* buf);
+
+/* Destino de dibujo temporal (backing store / caché). Anidar push/pop máx. 8 niveles. */
+void gfx_push_canvas(uint32_t* buf, int w, int h, int stride_u32);
+void gfx_pop_canvas(void);
+
+/* Backbuffer activo (32 bpp): NULL si no hay lienzo. */
+uint32_t* gfx_backbuffer_u32(void);
+int       gfx_backbuffer_stride_u32(void);
 
 /* Reserva backbuffer con kmalloc y copia al LFB en present (sin parpadeo directo) */
 void gfx_enable_double_buffer_kmalloc(void);

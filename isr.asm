@@ -7,11 +7,13 @@ extern timer_body
 extern keyboard_body
 extern mouse_body
 extern irq_stub_body
+extern e1000_irq_body
 
 global timer_handler
 global keyboard_handler
 global mouse_handler
 global irq_stub
+global e1000_handler
 global isr_halt
 
 %macro ISR_NOERR 1
@@ -50,6 +52,9 @@ mouse_handler:
 
 irq_stub:
     ISR_NOERR irq_stub_body
+
+e1000_handler:
+    ISR_NOERR e1000_irq_body
 
 isr_halt:
     cli

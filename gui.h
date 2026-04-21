@@ -19,12 +19,15 @@
 #define UI_TYPE_PROGRESS_BAR 3
 
 typedef void (*UI_ElementCallback)(void);
+typedef void (*UI_KeypressFn)(char key);
 
 typedef struct UI_Element {
     int  id;
     int  x, y, w, h;
     int  type;                  /* UI_TYPE_* */
     UI_ElementCallback callback;
+    int                is_focusable; /* 0 = omitir en Tab (p. ej. progress) */
+    UI_KeypressFn      on_keypress; /* opcional; NULL = teclas por defecto */
 
     /* TEXT_INPUT ─────────────────────────────────────────────────────── */
     char text_buffer[256];      /* contenido actual (null-terminado) */
@@ -46,8 +49,16 @@ extern UI_Element ui_elements[UI_MAX_ELEMENTS];
 extern int        ui_element_count;
 extern int        focused_element_index;
 
-/* ── Foco ──────────────────────────────────────────────────────────────── */
+/* ── Foco / anillo de widgets focusables (orden de Tab) ───────────────── */
 void ui_focus_advance(void);
+void ui_focus_chain_rebuild(void);
+void ui_focus_tab_next(void);
+void ui_focus_tab_prev(void);
+void ui_focus_reset_step(void);
+void gui_blur_widget(int focus_idx);
+void gui_focus_widget(int focus_idx);
+void ui_sync_focus_ring_from_mouse(void);
+
 void ui_redraw(void);
 void ui_focus_clear(void);
 
@@ -84,5 +95,35 @@ int  gui_framebuffer_init_kmalloc(const VesaBootInfo* vbi);
 void gui_put_pixel(int x, int y, uint32_t rgb);
 void gui_draw_rect(int x, int y, int w, int h, uint32_t rgb);
 void swap_buffers(void);
+
+/*
+ * Un frame de escritorio: compositor (solo regiones dañadas en RAM) +
+ * menú contextual + cursor + presentación parcial al LFB.
+ */
+void gui_render_frame(int sw, int sh, int mx, int my, int* dock_hover, int menu_o, int menu_s,
+                      int ax, int ay);
+
+/* ── Tema GTK/macOS (ARGB 0xAARRGGBB; el motor usa RGB en framebuffer) ─── */
+extern uint32_t COLOR_BG_WINDOW;
+extern uint32_t COLOR_ACCENT;
+extern uint32_t COLOR_TEXT_PRIMARY;
+extern uint32_t COLOR_BORDER;
+extern uint32_t COLOR_DESKTOP_BG;
+
+void draw_rounded_rect(int x, int y, int w, int h, int radius, uint32_t color_argb);
+
+/* Alpha-over: mezcla fg sobre bg usando el canal A de fg (sin float). Orden (bg, fg). */
+uint32_t gui_blend_colors(uint32_t bg, uint32_t fg);
+
+/* Relleno redondeado; color 0xAARRGGBB (alpha 0 en alto = opaco, convención gfx). */
+void draw_rounded_rect_filled(int x, int y, int w, int h, int radius, uint32_t color);
+
+/*
+ * Sombra proyectada (capas redondeadas, mayor opacidad junto al borde).
+ * base_color: tinte RGB (byte alto FF o 0); se usa el RGB de 24 bits bajos.
+ */
+void draw_drop_shadow(int x, int y, int w, int h, int radius, int spread, uint32_t base_color);
+
+void draw_shadow_rect(int x, int y, int w, int h);
 
 #endif

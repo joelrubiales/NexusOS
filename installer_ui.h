@@ -4,7 +4,7 @@
 #include "window.h"
 
 /* Debe coincidir con WM_TITLE_H / WM_CLIENT_INSET en window.c */
-#define INSTALLER_WIN_TITLE_H   34
+#define INSTALLER_WIN_TITLE_H   52
 #define INSTALLER_WIN_INSET     4
 
 /*

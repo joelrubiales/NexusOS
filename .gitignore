@@ -1,10 +1,13 @@
 # Artefactos de compilación
 *.o
+smp_trampoline.bin
+smp_trampoline.elf
 kernel.elf
 kernel.tmp
 iso/
 NexusOS.iso
 dist/
+userland/*.elf
 *.img
 vbox_latest.log
 

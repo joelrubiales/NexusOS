@@ -16,7 +16,10 @@
 #include "task.h"
 #include "memory.h"
 #include "nexus.h"
+#include "elf_loader.h"
 #include "pit.h"
+#include "xhci.h"
+#include "net.h"
 
 /* ── Estado global ─────────────────────────────────────────────────── */
 volatile int sched_enabled  = 0;
@@ -31,6 +34,8 @@ static uint64_t quantum_count = 0;
 #define SEL_CODE64  0x18ULL   /* 64-bit code ring 0 */
 #define SEL_DATA32  0x10ULL   /* 32-bit data ring 0 (SS en Long Mode) */
 #define RFLAGS_IF   0x202ULL  /* IF=1, bit 1 siempre activo            */
+#define SEL_UCODE64 0x33ULL
+#define SEL_UDATA   0x2Bu
 
 /* ── Privado ────────────────────────────────────────────────────────── */
 
@@ -103,6 +108,33 @@ static uint64_t* build_initial_frame(uint64_t* stack_top, void (*entry)(void)) {
     return sp;
 }
 
+static uint64_t* build_user_initial_frame(uint64_t* stack_top_k, uint64_t user_rsp, uint64_t user_rip) {
+    uint64_t* sp = stack_top_k;
+
+    *--sp = SEL_UDATA;
+    *--sp = user_rsp;
+    *--sp = RFLAGS_IF;
+    *--sp = SEL_UCODE64;
+    *--sp = user_rip;
+
+    *--sp = 0; /* RAX */
+    *--sp = 0; /* RCX */
+    *--sp = 0; /* RDX */
+    *--sp = 0; /* RBX */
+    *--sp = 0; /* RSI */
+    *--sp = 0; /* RDI */
+    *--sp = 0; /* RBP */
+    *--sp = 0; /* R8  */
+    *--sp = 0; /* R9  */
+    *--sp = 0; /* R10 */
+    *--sp = 0; /* R11 */
+    *--sp = 0; /* R12 */
+    *--sp = 0; /* R13 */
+    *--sp = 0; /* R14 */
+    *--sp = 0; /* R15 */
+    return sp;
+}
+
 /* ── API pública ────────────────────────────────────────────────────── */
 
 void sched_init(void) {
@@ -140,6 +172,29 @@ int sched_new_task(void (*entry)(void), const char* name) {
     return idx;
 }
 
+int sched_new_user_task(uint64_t user_rip, uint64_t user_rsp, const char* name) {
+    uint64_t* stack;
+    uint64_t* sp;
+    int idx;
+
+    if (sched_task_count >= SCHED_MAX_TASKS)
+        return -1;
+
+    stack = (uint64_t*)kmalloc((uint64_t)SCHED_STACK_WORDS * 8u);
+    if (!stack)
+        return -1;
+
+    sp  = build_user_initial_frame(stack + SCHED_STACK_WORDS, user_rsp, user_rip);
+    idx = sched_task_count;
+
+    sched_tasks[idx].id    = next_id++;
+    sched_tasks[idx].rsp   = (uint64_t)sp;
+    sched_tasks[idx].state = TASK_READY;
+    sched_tasks[idx].name  = name;
+    sched_task_count++;
+    return idx;
+}
+
 void sched_task_exit(void) {
     __asm__ volatile("cli");
     if (current_tid < sched_task_count)
@@ -156,11 +211,18 @@ void sched_task_exit(void) {
  * CRÍTICO: esta función envía el EOI al PIC e incrementa ticks.
  * El handler ASM NO hace nada de eso.
  */
+int sched_current_tid(void) {
+    return current_tid;
+}
+
 uint64_t sched_tick(uint64_t current_rsp) {
     int   next, i;
 
     /* 1. Incrementar ticks (sustituye pit_irq_tick cuando el scheduler está activo). */
     ticks++;
+
+    xhci_poll();
+    net_poll_rx_if_needed();
 
     /* 2. EOI al PIC maestro (IRQ0 solo necesita PIC1). */
     outb(0x20, 0x20);

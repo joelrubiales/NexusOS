@@ -1,6 +1,7 @@
 /*
  * Doble búfer: kmalloc(pitch * height) + gfx_attach_double_buffer().
- * Dibujar solo en el backbuffer; al final del frame, swap_buffers() copia al LFB (rep movsq).
+ * Doble búfer en RAM: compositor_render() solo repinta dirty rects; swap_buffers() copia al LFB
+ * filas tocadas (memcpy_fast 64B) o pantalla completa si no hay marcas parciales.
  */
 #include "gui.h"
 #include "gfx.h"
@@ -16,6 +17,9 @@
 #include "top_panel.h"
 #include "event.h"
 #include "font_data.h"
+#include "compositor.h"
+#include "xhci.h"
+#include "ui_manager.h"
 #include <stdint.h>
 
 extern volatile unsigned char tecla_nueva;
@@ -68,8 +72,113 @@ void gui_draw_rect(int x, int y, int w, int h, uint32_t rgb) {
     }
 }
 
+/* Paleta estilo Apple / iOS (ARGB). */
+uint32_t COLOR_BG_WINDOW    = 0xFFF5F5F7u;
+uint32_t COLOR_ACCENT       = 0xFF007AFFu;
+uint32_t COLOR_TEXT_PRIMARY = 0xFF1D1D1Fu;
+uint32_t COLOR_BORDER       = 0xFFE5E5EAu;
+uint32_t COLOR_DESKTOP_BG   = 0xFF2D3138u;
+
+static uint32_t gui_argb_opaque(uint32_t c) {
+    return (c & 0x00FFFFFFu) | 0xFF000000u;
+}
+
+uint32_t gui_blend_colors(uint32_t bg, uint32_t fg) {
+    /* gfx: convención alpha-over estándar (fg sobre bg). */
+    return blend_colors(fg, bg);
+}
+
+void draw_rounded_rect_filled(int x, int y, int w, int h, int radius, uint32_t color) {
+    int r = radius;
+    if (w < 1 || h < 1)
+        return;
+    if (r > w / 2)
+        r = w / 2;
+    if (r > h / 2)
+        r = h / 2;
+    if (r < 0)
+        r = 0;
+    gfx_fill_rounded_rect_aa(x, y, w, h, r, color);
+}
+
+/*
+ * Rectángulo redondeado relleno (anti-aliasing vía motor gfx).
+ * `color_argb` admite 0xAARRGGBB; se fuerza relleno opaco.
+ */
+void draw_rounded_rect(int x, int y, int w, int h, int radius, uint32_t color_argb) {
+    draw_rounded_rect_filled(x, y, w, h, radius, gui_argb_opaque(color_argb));
+}
+
+/*
+ * Sombra: capas concéntricas (mismo radio, desplazamiento creciente), alpha
+ * mayor cerca de la tarjeta y más suave hacia fuera.
+ */
+void draw_drop_shadow(int x, int y, int w, int h, int radius, int spread, uint32_t base_color) {
+    int          br, bgc, bb, r, s;
+    unsigned int a;
+    uint32_t     argb;
+
+    if (w < 1 || h < 1)
+        return;
+    if (spread < 2)
+        spread = 2;
+    if (spread > 56)
+        spread = 56;
+
+    br  = (int)((base_color >> 16) & 0xFFu);
+    bgc = (int)((base_color >> 8) & 0xFFu);
+    bb  = (int)(base_color & 0xFFu);
+
+    r = radius;
+    if (r > w / 2)
+        r = w / 2;
+    if (r > h / 2)
+        r = h / 2;
+    if (r < 0)
+        r = 0;
+
+    for (s = spread; s >= 1; s--) {
+        unsigned inv = (unsigned)(spread - s + 1);
+        a = 10u + (unsigned)(215u * inv / (unsigned)spread);
+        if (a > 238u)
+            a = 238u;
+        argb = ((uint32_t)a << 24) | ((uint32_t)(unsigned)br << 16) | ((uint32_t)(unsigned)bgc << 8)
+             | (uint32_t)(unsigned)bb;
+        {
+            int ox = (s * 5) / 8;
+            int oy = (s * 3) / 4;
+            gfx_fill_rounded_rect_aa(x + ox, y + oy, w, h, r, argb);
+        }
+    }
+}
+
+/*
+ * Sombra de elevación: capas semitransparentes desplazadas (simétrico al drop
+ * shadow de GTK/Cocoa, sin depender de la forma redondeada del destino).
+ */
+void draw_shadow_rect(int x, int y, int w, int h) {
+    int s;
+    if (w < 1 || h < 1)
+        return;
+    for (s = 10; s >= 1; s--) {
+        unsigned a = (unsigned)(12 + s * 7);
+        if (a > 140)
+            a = 140;
+        gfx_blend_rect(x + s, y + s + 2, w, h, RGB(0, 0, 0), a);
+    }
+}
+
 void swap_buffers(void) {
     gfx_swap_buffers();
+}
+
+void gui_render_frame(int sw, int sh, int mx, int my, int* dock_hover, int menu_o, int menu_s,
+                      int ax, int ay) {
+    compositor_cursor_moved(mx, my);
+    compositor_render(sw, sh, mx, my, dock_hover);
+    desktop_draw_app_menu(menu_o, menu_s, ax, ay);
+    gfx_draw_cursor(mx, my);
+    swap_buffers();
 }
 
 static int SW, SH;
@@ -78,11 +187,11 @@ static int desk_x, desk_y, desk_w, desk_h;
 #define MAX_WIN 6
 static NWM_Window wins[MAX_WIN];
 static int  win_count, focus_id;
-static int  zorder[MAX_WIN], zcount;
 static int  menu_open, menu_sel;
 
 static void z_raise(int id) {
-    nwm_raise_window(zorder, zcount, id);
+    if (id >= 0 && id < win_count)
+        nwm_dll_raise(&wins[id]);
 }
 
 static void win_show(int id) {
@@ -93,19 +202,26 @@ static void win_show(int id) {
     wins[id].visible = 1;
     focus_id = id;
     z_raise(id);
+    nwm_window_mark_dirty(&wins[id]);
+    compositor_damage_rect_pad(wins[id].x, wins[id].y, wins[id].w, wins[id].h,
+                               NEXUS_COMPOSITOR_SHADOW_PAD);
 }
 
 static void win_hide(int id) {
     int i;
+    NWM_Window* wp;
     if (id < 0 || id >= win_count) return;
+    if (wins[id].visible)
+        compositor_damage_rect_pad(wins[id].x, wins[id].y, wins[id].w, wins[id].h,
+                                   NEXUS_COMPOSITOR_SHADOW_PAD);
     wins[id].visible = 0;
     wins[id].focused = 0;
     if (focus_id == id) {
         focus_id = -1;
-        for (i = zcount - 1; i >= 0; i--) {
-            int w = zorder[i];
-            if (wins[w].visible) {
-                win_show(w);
+        for (wp = nwm_z_stack_top(); wp; wp = wp->z_prev) {
+            i = (int)(wp - wins);
+            if (i >= 0 && i < win_count && wins[i].visible) {
+                win_show(i);
                 return;
             }
         }
@@ -116,7 +232,7 @@ static void draw_terminal(NWM_Window* w);
 static void draw_files(NWM_Window* w);
 static void draw_sysmon(NWM_Window* w);
 static void draw_about(NWM_Window* w);
-static void paint_client_cb(void* user, int win_idx);
+static void paint_client_for_win(NWM_Window* w);
 
 static int slen(const char* s) {
     int n = 0;
@@ -313,16 +429,14 @@ static void draw_about(NWM_Window* w) {
     gfx_draw_text(ax + 20, y2, "Net:     NIC detected, no TCP/IP", COL_DIM, NWM_COL_BODY);
 }
 
-static void paint_client_cb(void* user, int win_idx) {
-    (void)user;
-    if (win_idx < 0 || win_idx >= win_count) return;
-    if (!wins[win_idx].visible) return;
-    switch (wins[win_idx].app_type) {
-        case 0: draw_terminal(&wins[win_idx]); break;
-        case 1: draw_files(&wins[win_idx]); break;
-        case 2: apps_draw_nexus_firefox(&wins[win_idx]); break;
-        case 3: draw_sysmon(&wins[win_idx]); break;
-        case 4: draw_about(&wins[win_idx]); break;
+static void paint_client_for_win(NWM_Window* w) {
+    if (!w) return;
+    switch (w->app_type) {
+        case 0: draw_terminal(w); break;
+        case 1: draw_files(w); break;
+        case 2: apps_draw_nexus_firefox(w); break;
+        case 3: draw_sysmon(w); break;
+        case 4: draw_about(w); break;
         default: break;
     }
 }
@@ -353,10 +467,12 @@ void gui_run(void) {
         }
         if (vesa_console_active)
             vesa_force_refresh();
-        mouse_init(vbi.width, vbi.height);
+        (void)mouse_init((int32_t)vbi.width, (int32_t)vbi.height);
+        xhci_set_screen_dims((int)vbi.width, (int)vbi.height);
     } else {
         gfx_init_vga();
-        mouse_init(320, 200);
+        (void)mouse_init(320, 200);
+        xhci_set_screen_dims(320, 200);
     }
 
     SW = gfx_width();
@@ -375,7 +491,6 @@ void gui_run(void) {
     win_count = 0;
     focus_id = -1;
     menu_open = 0;
-    zcount = 0;
 
     {
         int desk_inner_h = layout_dock_y - layout_top_h;
@@ -411,14 +526,19 @@ void gui_run(void) {
         {
             int cx0 = (SW - w0) / 2;
             int cy0 = layout_top_h + (desk_inner_h - h0) / 2;
-            wins[0] = (NWM_Window){cx0 - st, cy0 - st / 2, w0, h0, 0, 0, 0, 0, 0, "Terminal", 0, 0};
-            wins[1] = (NWM_Window){cx0 + st, cy0 + st / 2, w0, h0, 0, 0, 0, 0, 0, "Files", 1, 0};
+            wins[0] = (NWM_Window){cx0 - st, cy0 - st / 2, w0, h0, 0, 0, 0, 0, 0, "Terminal", 0,
+                                   NULL, 0, 0, 0, 1, NULL, NULL};
+            wins[1] = (NWM_Window){cx0 + st, cy0 + st / 2, w0, h0, 0, 0, 0, 0, 0, "Files", 1,
+                                   NULL, 0, 0, 0, 1, NULL, NULL};
             wins[2] = (NWM_Window){(SW - w_fx) / 2, layout_top_h + (desk_inner_h - h_fx) / 2 + st,
-                                   w_fx, h_fx, 0, 0, 0, 0, 0, "Nexus Firefox", 2, 0};
+                                   w_fx, h_fx, 0, 0, 0, 0, 0, "Nexus Firefox", 2,
+                                   NULL, 0, 0, 0, 1, NULL, NULL};
             wins[3] = (NWM_Window){(SW - w3) / 2 + st * 2, layout_top_h + (desk_inner_h - h3) / 3,
-                                   w3, h3, 0, 0, 0, 0, 0, "System Monitor", 3, 0};
+                                   w3, h3, 0, 0, 0, 0, 0, "System Monitor", 3,
+                                   NULL, 0, 0, 0, 1, NULL, NULL};
             wins[4] = (NWM_Window){(SW - w4) / 2 - st, layout_top_h + (2 * desk_inner_h) / 3 - h4 / 2,
-                                   w4, h4, 0, 0, 0, 0, 0, "About NexusOS", 4, 0};
+                                   w4, h4, 0, 0, 0, 0, 0, "About NexusOS", 4,
+                                   NULL, 0, 0, 0, 1, NULL, NULL};
         }
         win_count = 5;
         for (int wi = 0; wi < win_count; wi++) {
@@ -430,15 +550,21 @@ void gui_run(void) {
         }
     }
 
-    for (int i = 0; i < win_count; i++) zorder[i] = i;
-    zcount = win_count;
+    nwm_dll_init_ring(wins, win_count);
 
     wins[0].visible = 1;
     wins[1].visible = 1;
     for (int i = 0; i < win_count; i++) wins[i].focused = 0;
     wins[0].focused = 1;
     focus_id = 0;
-    nwm_raise_window(zorder, zcount, 0);
+    nwm_dll_raise(&wins[0]);
+
+    {
+        int stride_u = gui_stride_u32 > 0 ? (int)gui_stride_u32 : SW;
+        compositor_init(SW, SH, stride_u);
+        compositor_bake_wallpaper_layer();
+        compositor_mark_full();
+    }
 
     {
         KbdState kbd;
@@ -455,16 +581,11 @@ void gui_run(void) {
         last_frame = ticks;
 
         /* ════════════════════════════════════════════════════════════════
-         * BUCLE DE MENSAJES — drena TODOS los eventos antes de renderizar.
+         * BUCLE DE MENSAJES — drena TODOS los Event antes de renderizar.
          *
-         * Ratón  : MOUSE_CLICK y MOUSE_MOVE gestionan clic, arrastre y
-         *          liberación sin necesidad de comparar prev_btns.
-         * Teclado: KEY_PRESS se descarta aquí; el teclado se sigue
-         *          procesando por la ruta legacy (tecla_nueva + KbdState)
-         *          porque keyboard_body() sigue asignando tecla_nueva para
-         *          que KbdState reciba todos los scan codes (incluyendo
-         *          shift y break codes que keyboard_irq() no traduce).
-         *          Drenar los KEY_PRESS evita que el ring buffer se llene.
+         * IRQ1/12 y xhci_poll solo encolan os_event_t; pop_event traduce.
+         * Ratón: MOUSE_MOVE / MOUSE_CLICK. Teclado: KEY_PRESS se ignora aquí;
+         * la entrada de texto sigue por tecla_nueva + KbdState.
          * ════════════════════════════════════════════════════════════════ */
         {
             Event nev;
@@ -473,6 +594,8 @@ void gui_run(void) {
 
                 /* ── Movimiento: arrastrar ventana si hay drag activo ─── */
                 case EVENT_MOUSE_MOVE:
+                    if (installer_win.is_visible && ui_element_count > 0)
+                        ui_manager_update_hover(nev.mouse_x, nev.mouse_y);
                     if (nev.mouse_buttons & 1) {
                         int i;
                         for (i = 0; i < win_count; i++) {
@@ -497,15 +620,10 @@ void gui_run(void) {
                     if (!(nev.mouse_buttons & 1))
                         break;  /* solo botón izquierdo */
 
-                    /* Elementos UI del instalador superpuesto. */
-                    if (installer_win.is_visible && ui_element_count > 0) {
-                        int ui_hit = ui_get_element_at(nev.mouse_x, nev.mouse_y);
-                        if (ui_hit >= 0) {
-                            focused_element_index = ui_hit;
-                            ui_activate_focused();
-                            break;
-                        }
-                    }
+                    /* Instalador: si el clic golpea un widget, no propagar al dock. */
+                    if (installer_win.is_visible && ui_element_count > 0
+                        && ui_manager_handle_primary_click(nev.mouse_x, nev.mouse_y))
+                        break;
 
                     {
                         int dh = desktop_dock_hit(SW, SH, nev.mouse_x, nev.mouse_y);
@@ -539,9 +657,10 @@ void gui_run(void) {
                             break;
                         }
                         {
-                            int i;
-                            for (i = zcount - 1; i >= 0; i--) {
-                                int id = zorder[i];
+                            NWM_Window* wp;
+                            for (wp = nwm_z_stack_top(); wp; wp = wp->z_prev) {
+                                int id = (int)(wp - wins);
+                                if (id < 0 || id >= win_count) continue;
                                 if (!wins[id].visible) continue;
                                 if (nev.mouse_x >= wins[id].x &&
                                     nev.mouse_x <  wins[id].x + wins[id].w &&
@@ -568,8 +687,49 @@ void gui_run(void) {
                     }
                     break;
 
-                /* ── KEY_PRESS: drenar para evitar desbordamiento ────── */
                 case EVENT_KEY_PRESS:
+                    if (installer_win.is_visible && ui_element_count > 0) {
+                        if (nev.key_extended) {
+                            if (nev.scancode == 0x50u || nev.scancode == 0x4Du) {
+                                ui_focus_tab_next();
+                                ui_manager_sync_focus_flags();
+                                break;
+                            }
+                            if (nev.scancode == 0x48u || nev.scancode == 0x4Bu) {
+                                ui_focus_tab_prev();
+                                ui_manager_sync_focus_flags();
+                                break;
+                            }
+                            break;
+                        }
+                        if (nev.scancode == 0x0Fu || nev.ascii == '\t') {
+                            ui_focus_tab_next();
+                            ui_manager_sync_focus_flags();
+                            break;
+                        }
+                        if (nev.scancode == 0x1Cu) {
+                            ui_activate_focused();
+                            break;
+                        }
+                        if (focused_element_index >= 0
+                            && focused_element_index < ui_element_count) {
+                            UI_Element* fel = &ui_elements[focused_element_index];
+                            if (fel->on_keypress) {
+                                if (nev.ascii)
+                                    fel->on_keypress(nev.ascii);
+                                break;
+                            }
+                            if (fel->type == UI_TYPE_TEXT_INPUT) {
+                                if (nev.scancode == 0x0Eu)
+                                    ui_handle_char('\b');
+                                else if (nev.ascii >= 32)
+                                    ui_handle_char((unsigned char)nev.ascii);
+                            }
+                        }
+                    }
+                    break;
+
+                /* ── KEY_PRESS: drenar para evitar desbordamiento ────── */
                 case EVENT_WINDOW_CLOSE:
                 default:
                     break;
@@ -579,27 +739,48 @@ void gui_run(void) {
 
         if (!running) continue;  /* salida por evento de ratón */
 
-        /* ── Renderizar frame ────────────────────────────────────────── */
+        /* ── Compositor (damage tracking) + capas superiores ─────────── */
         gfx_layout_refresh();
-        draw_desktop();
-        desktop_draw_top_bar();
-        top_panel_draw(SW, SH);
-        nwm_paint_painter_order(wins, win_count, zorder, zcount, paint_client_cb, 0);
 
-        desktop_paint_wm_windows();
+        if (menu_open)
+            compositor_mark_full();
+        if (installer_win.is_visible)
+            compositor_mark_full();
+
+        {
+            static int term_phase = -1;
+            int p = (int)((ticks / 400) & 1);
+            if (p != term_phase) {
+                term_phase = p;
+                if (wins[0].visible)
+                    nwm_window_mark_dirty(&wins[0]);
+            }
+        }
+        if (wins[3].visible)
+            nwm_window_mark_dirty(&wins[3]);
+
+        {
+            int wi;
+            for (wi = 0; wi < win_count; wi++) {
+                if (wins[wi].visible)
+                    nwm_window_ensure_backing(&wins[wi], paint_client_for_win);
+            }
+        }
 
         desktop_get_launcher_rect(SW, SH, &lx, &ly, &lw, &lh);
         anchor_x = lx + lw / 2;
         anchor_y = ly;
 
-        desktop_draw_dock(SW, SH, mouse_x, mouse_y, &dock_hover);
-        desktop_draw_app_menu(menu_open, menu_sel, anchor_x, anchor_y);
-
-        gfx_draw_cursor(mouse_x, mouse_y);
-        swap_buffers();
+        gui_render_frame(SW, SH, (int)mouse_get_x(), (int)mouse_get_y(), &dock_hover, menu_open,
+                           menu_sel, anchor_x, anchor_y);
 
         /* ── Teclado (ruta legacy: tecla_nueva + KbdState) ──────────── */
         if (!tecla_nueva) continue;
+        /* Instalador: entrada vía EVENT_KEY_PRESS (pop_event); evitar doble Tab/Enter. */
+        if (installer_win.is_visible && ui_element_count > 0) {
+            tecla_nueva = 0;
+            continue;
+        }
         {
             unsigned char sc = tecla_nueva;
             KbdEvent kev;
@@ -661,10 +842,15 @@ void gui_run(void) {
     }
     }
 
+    {
+        int bi;
+        for (bi = 0; bi < win_count; bi++)
+            nwm_window_free_backing(&wins[bi]);
+    }
     win_count = 0;
     focus_id = -1;
     menu_open = 0;
-    zcount = 0;
+    compositor_shutdown();
     {
         VesaBootInfo vbi2;
         if (gfx_vesa_detect(&vbi2)) {
@@ -683,10 +869,90 @@ UI_Element ui_elements[UI_MAX_ELEMENTS];
 int        ui_element_count;
 int        focused_element_index;
 
-/* ── Foco ───────────────────────────────────────────────────────────────── */
+/* Orden de Tab: índices en ui_elements[]. */
+static int ui_focus_order[UI_MAX_ELEMENTS];
+static int ui_focus_order_count;
+static int ui_focus_ring_index;
+static int ui_tracked_focus_id = -1;
+
+/* ── Foco / anillo focusable ───────────────────────────────────────────── */
+void ui_focus_reset_step(void) {
+    ui_tracked_focus_id = -1;
+}
+
+void gui_blur_widget(int focus_idx) {
+    (void)focus_idx;
+}
+
+void gui_focus_widget(int focus_idx) {
+    if (focus_idx < 0 || focus_idx >= ui_focus_order_count)
+        return;
+    ui_focus_ring_index     = focus_idx;
+    focused_element_index   = ui_focus_order[focus_idx];
+    ui_tracked_focus_id     = ui_elements[focused_element_index].id;
+}
+
+void ui_sync_focus_ring_from_mouse(void) {
+    int i;
+    if (focused_element_index < 0 || focused_element_index >= ui_element_count)
+        return;
+    for (i = 0; i < ui_focus_order_count; i++) {
+        if (ui_focus_order[i] == focused_element_index) {
+            ui_focus_ring_index = i;
+            ui_tracked_focus_id = ui_elements[focused_element_index].id;
+            return;
+        }
+    }
+}
+
+void ui_focus_chain_rebuild(void) {
+    int i, slot;
+
+    ui_focus_order_count = 0;
+    for (i = 0; i < ui_element_count; i++) {
+        if (ui_elements[i].is_focusable)
+            ui_focus_order[ui_focus_order_count++] = i;
+    }
+
+    if (ui_focus_order_count <= 0) {
+        ui_focus_ring_index   = 0;
+        focused_element_index = 0;
+        return;
+    }
+
+    slot = 0;
+    if (ui_tracked_focus_id >= 0) {
+        for (i = 0; i < ui_focus_order_count; i++) {
+            if (ui_elements[ui_focus_order[i]].id == ui_tracked_focus_id) {
+                slot = i;
+                break;
+            }
+        }
+    }
+
+    ui_focus_ring_index     = slot;
+    focused_element_index   = ui_focus_order[slot];
+    ui_tracked_focus_id     = ui_elements[focused_element_index].id;
+}
+
+void ui_focus_tab_next(void) {
+    if (ui_focus_order_count <= 0)
+        return;
+    gui_blur_widget(ui_focus_ring_index);
+    ui_focus_ring_index = (ui_focus_ring_index + 1) % ui_focus_order_count;
+    gui_focus_widget(ui_focus_ring_index);
+}
+
+void ui_focus_tab_prev(void) {
+    if (ui_focus_order_count <= 0)
+        return;
+    gui_blur_widget(ui_focus_ring_index);
+    ui_focus_ring_index = (ui_focus_ring_index + ui_focus_order_count - 1) % ui_focus_order_count;
+    gui_focus_widget(ui_focus_ring_index);
+}
+
 void ui_focus_advance(void) {
-    if (ui_element_count <= 0) return;
-    focused_element_index = (focused_element_index + 1) % ui_element_count;
+    ui_focus_tab_next();
 }
 
 void ui_redraw(void) {
@@ -694,8 +960,12 @@ void ui_redraw(void) {
 }
 
 void ui_focus_clear(void) {
-    ui_element_count      = 0;
-    focused_element_index = 0;
+    ui_element_count       = 0;
+    focused_element_index  = 0;
+    ui_focus_order_count   = 0;
+    ui_focus_ring_index    = 0;
+    ui_tracked_focus_id    = -1;
+    ui_manager_clear();
 }
 
 /* ── Hit-test ───────────────────────────────────────────────────────────── */
@@ -711,8 +981,10 @@ int ui_get_element_at(int x, int y) {
 
 void ui_update_focus_from_mouse(int mx, int my) {
     int idx = ui_get_element_at(mx, my);
-    if (idx >= 0)
+    if (idx >= 0 && ui_elements[idx].is_focusable) {
         focused_element_index = idx;
+        ui_sync_focus_ring_from_mouse();
+    }
 }
 
 /* ── Activación ─────────────────────────────────────────────────────────── */
@@ -749,6 +1021,8 @@ static int ui_push_base(int id, int x, int y, int w, int h,
     e->x  = x; e->y = y; e->w = w; e->h = h;
     e->type     = type;
     e->callback = cb;
+    e->on_keypress   = 0;
+    e->is_focusable  = (type != UI_TYPE_PROGRESS_BAR) ? 1 : 0;
     return idx;
 }
 
@@ -809,11 +1083,14 @@ void ui_draw_element(int idx) {
         /* Fondo */
         gfx_fill_rounded_rect(e->x, e->y, e->w, e->h, 6, RGB(22, 26, 42));
 
-        /* Borde + focus ring */
+        /* Borde + anillo de foco (+2 px exterior, azul claro) */
         if (focused) {
-            gfx_rounded_rect_stroke_aa(e->x - 3, e->y - 3,
-                                       e->w + 6, e->h + 6, 9,
-                                       ARGB(90, 0, 150, 220));
+            gfx_rounded_rect_stroke_aa(e->x - 2, e->y - 2,
+                                       e->w + 4, e->h + 4, 8,
+                                       RGB(130, 215, 255));
+            gfx_rounded_rect_stroke_aa(e->x - 1, e->y - 1,
+                                       e->w + 2, e->h + 2, 7,
+                                       RGB(200, 235, 255));
             gfx_rounded_rect_stroke_aa(e->x, e->y, e->w, e->h, 6,
                                        RGB(0, 150, 210));
         } else {
@@ -890,7 +1167,9 @@ void ui_draw_element(int idx) {
             gfx_fill_rounded_rect(bx, by, bs, bs, 5, RGB(22, 26, 42));
             if (focused) {
                 gfx_rounded_rect_stroke_aa(bx - 2, by - 2, bs + 4, bs + 4, 7,
-                                           ARGB(90, 0, 150, 220));
+                                           RGB(130, 215, 255));
+                gfx_rounded_rect_stroke_aa(bx - 1, by - 1, bs + 2, bs + 2, 6,
+                                           RGB(200, 235, 255));
                 gfx_rounded_rect_stroke_aa(bx, by, bs, bs, 5, RGB(0, 150, 210));
             } else {
                 gfx_rounded_rect_stroke_aa(bx, by, bs, bs, 5, RGB(55, 60, 85));

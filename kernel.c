@@ -6,6 +6,8 @@
 #include "font8x8.h"
 #include "teclado.h"
 #include "pci.h"
+#include "hda.h"
+#include "xhci.h"
 #include "nic.h"
 #include "gui.h"
 #include "mouse.h"
@@ -14,7 +16,12 @@
 #include "boot_info.h"
 #include "shell.h"
 #include "gui_installer.h"
+#include "nexus_userland.h"
 #include "vfs.h"
+#include "ext2.h"
+#include "smp.h"
+#include "syscalls.h"
+#include "net.h"
 #include <stddef.h>
 
 /* 1 = sin startx; 0 = escritorio tras consola VESA. */
@@ -32,7 +39,7 @@
 #define MB2_TAG_MODULE              3u
 #define MB2_TAG_FRAMEBUFFER         8u
 
-int boot_mode = 0;
+static int boot_mode = 0;
 
 static char nexus_cmdline[256];
 
@@ -470,7 +477,7 @@ void kernel_main(uint32_t magic, uint32_t mb2_info_addr) {
         line[p] = 0;
         dmesg_log(line);
     }
-    dmesg_log("[    0.001000] CPU: x86_64 Long Mode active, 6 cores");
+    dmesg_log("[    0.001000] CPU: x86_64 Long Mode (SMP tras IDT)");
     dmesg_log("[    0.002000] Memory: 512MB RAM detected");
     dmesg_log("[    0.003000] IDT: 256 entries installed (16-byte x64 gates)");
     dmesg_log("[    0.004000] PIT: channel 0 configured @ 1000 Hz (~1 ms/tick)");
@@ -481,10 +488,39 @@ void kernel_main(uint32_t magic, uint32_t mb2_info_addr) {
     dmesg_log("[    0.009000] PS/2 Mouse: IRQ12 enabled");
 
     instalar_idt();
+    syscalls_init();
+    {
+        XhciInfo xhci = {0};
+        if (xhci_init(mb2_info_addr, &xhci) == 0 && xhci.present) {
+            if (xhci_usb_mouse_active)
+                dmesg_log("[    0.009150] xHCI: USB HID boot mouse active (polling)");
+            else
+                dmesg_log("[    0.009150] xHCI: controller OK, no HID mouse (use PS/2)");
+        } else
+            dmesg_log("[    0.009150] xHCI: absent or init failed (PS/2 mouse)");
+    }
+    {
+        int ha = hda_init();
+        if (ha == 0)
+            dmesg_log("[    0.009175] HDA: Intel HD Audio init (MMIO, CORB/RIRB, PCM skeleton)");
+        else
+            dmesg_log("[    0.009175] HDA: no controller or init failed (optional)");
+    }
+    /* MADT + SIPI: requiere IDT cargada (APs hacen sti;hlt). */
+    smp_init(mb2_info_addr);
     multitasking_init();
-    if(disk_init() == 0)
-        dmesg_log("[    0.009500] ATA: primary master PIO (ports 0x1F0-0x1F7)");
+    net_init();
+    if (net_ready())
+        dmesg_log("[    0.009250] net: E1000 link up, ARP for 10.0.2.15 (slirp)");
     else
+        dmesg_log("[    0.009250] net: E1000 not present or init failed");
+    if (disk_init() == 0) {
+        dmesg_log("[    0.009500] ATA: primary master PIO (ports 0x1F0-0x1F7)");
+        if (ext2_mount(0) == 0)
+            dmesg_log("[    0.009520] EXT2: read-only volume (superblock @ 1024, magic 0xEF53)");
+        else
+            dmesg_log("[    0.009520] EXT2: not present or invalid (optional; initrd/TAR still used)");
+    } else
         dmesg_log("[    0.009500] ATA: init timeout (VM sin disco IDE)");
     dmesg_log("[    0.009800] MM: PMM bitmap + kmalloc heap 32 MiB @ 32 MiB");
     dmesg_log("[    0.010000] Interrupts enabled");
@@ -548,6 +584,11 @@ void kernel_main(uint32_t magic, uint32_t mb2_info_addr) {
     /* Bifurcación principal: subsistema gráfico vs solo consola (Multiboot2 cmdline). */
     if (boot_mode == 0) {
         init_desktop();
+        if (nexus_try_boot_userland() == 0) {
+            __asm__ volatile("sti");
+            for (;;)
+                __asm__ volatile("hlt");
+        }
         start_gui_installer();
     } else {
         start_shell();
@@ -1080,7 +1121,10 @@ else if(comparar_cadenas(cmd,"ip a")||comparar_cadenas(cmd,"ip addr")||comparar_
 else if(empieza_con(cmd,"ping ")) {
     cursor=kprint_color("PING ",cursor,0x0F);cursor=kprint_color(a1,cursor,0x0F);
     cursor=kprint_color(" (",cursor,0x07);cursor=kprint_color(a1,cursor,0x0F);cursor=kprint_color(") 56(84) bytes of data.\n",cursor,0x07);
-    cursor=kprint_color("Request timeout (no TCP/IP stack)\n",cursor,0x08);
+    if (net_ready())
+        cursor=kprint_color("ICMP not implemented (kernel has ARP + raw Ethernet only)\n",cursor,0x08);
+    else
+        cursor=kprint_color("Request timeout (no NIC stack)\n",cursor,0x08);
 }
 
 /* ══════ CURL / WGET ══════════════════════════════════════════════════════ */

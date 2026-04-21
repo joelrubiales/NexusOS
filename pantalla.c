@@ -3,8 +3,10 @@
 #include "boot_info.h"
 #include "font8x8.h"
 #include "pci.h"
+#include "smp.h"
 
 int vesa_console_active = 0;
+int nexus_tty_cursor = 0;
 
 #define MAX_COLS 160
 #define MAX_ROWS 120
@@ -371,6 +373,9 @@ int kprint_color(char* texto, int cursor, char color) {
     int vcols = vesa_console_active ? dyn_cols : 80;
     int stride = vcols * 2;
 
+    if (smp_needs_locks())
+        spinlock_lock(&smp_console_lock);
+
     for(int i = 0; texto[i]; i++) {
         if(texto[i] == '\n') {
             cursor = (cursor / stride + 1) * stride;
@@ -388,6 +393,9 @@ int kprint_color(char* texto, int cursor, char color) {
         }
     }
     if(vesa_console_active) vesa_console_flush();
+    if (smp_needs_locks())
+        spinlock_unlock(&smp_console_lock);
+    nexus_tty_cursor = cursor;
     return cursor;
 }
 
